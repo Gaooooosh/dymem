@@ -20,10 +20,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.utils import logging
 
+from ..utils import GroupLinear
 from fla.modules.activations import ACT2FN
 from fla.modules.layernorm_gated import RMSNormGated
-
-from ..utils import GroupLinear
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
@@ -39,6 +38,7 @@ with warnings.catch_warnings():
     is_fast_path_available = selective_state_update is not None
 
 if TYPE_CHECKING:
+
     from fla.models.mamba2.modeling_mamba2 import Mamba2Cache
     from fla.models.utils import Cache
     from transformers.processing_utils import Unpack

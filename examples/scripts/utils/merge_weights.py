@@ -10,8 +10,8 @@ from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 from huggingface_hub import snapshot_download
 
 # Register custom Qwen layers that add AHN support.
-from ahn.transformer.qwen2_ahn import register_customized_qwen2
-from ahn.transformer.qwen3_ahn import register_customized_qwen3
+from dymem.transformer.qwen2_ahn import register_customized_qwen2
+from dymem.transformer.qwen3_ahn import register_customized_qwen3
 
 register_customized_qwen2()
 register_customized_qwen3()

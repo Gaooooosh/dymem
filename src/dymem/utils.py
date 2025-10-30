@@ -179,7 +179,6 @@ class BaseAHN(nn.Module):
 
         return o, past_key_values
 
-
 class AHNRouter(nn.Module):
     def __init__(self, num_heads: int, head_dim: int, use_dimwise_pos: bool = False):
         super().__init__()

@@ -15,8 +15,8 @@ from pathlib import Path
 from lm_eval import evaluator
 from lm_eval.tasks import TaskManager
 # Register custom Qwen layers that add AHN support (same as in inference.py)
-from ahn.transformer.qwen2_ahn import register_customized_qwen2
-from ahn.transformer.qwen3_ahn import register_customized_qwen3
+from dymem.transformer.qwen2_ahn import register_customized_qwen2
+from dymem.transformer.qwen3_ahn import register_customized_qwen3
 
 
 def parse_args():

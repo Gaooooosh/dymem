@@ -12,12 +12,12 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 from typing import Union, Optional, Tuple, List, Dict, Any
-from ahn.transformer.qwen2 import (
+from dymem.transformer.qwen2 import (
     Qwen2Config as Qwen2Config_,
     Qwen2Model as Qwen2Model_,
     Qwen2ForCausalLM as Qwen2ForCausalLM_,
 )
-from ahn.transformer.qwen2.modeling_qwen2 import (
+from dymem.transformer.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2MLP,
     Qwen2DecoderLayer,
@@ -28,8 +28,8 @@ from ahn.transformer.qwen2.modeling_qwen2 import (
     rotate_half,
 )
 
-from ahn.utils import BaseAHN, AHNRouter
-from ahn.rnn import DeltaNet, GatedDeltaNet, Mamba2
+from dymem.utils import BaseAHN, AHNRouter
+from dymem.rnn import DeltaNet, GatedDeltaNet, Mamba2
 from dataclasses import dataclass
 from fla.models.utils import Cache as MemCache
 from transformers.cache_utils import Cache, DynamicCache
@@ -237,30 +237,20 @@ class Qwen2MemFlexAttn(Qwen2Attention):
             position_embeddings=position_embeddings,
         )
 
-        if enable_ahn:
-            attn_output = self.flex_attn_forward(
-                bsz=bsz,
-                q_len=q_len,
-                attention_mask=attention_mask,
-                query_states=query_states,
-                key_states=key_states,
-                value_states=value_states,
-            )
-        else:
-            attn_output = _flash_attention_forward(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                q_len,
-                position_ids=position_ids,
-                dropout=dropout_rate,
-                sliding_window=None, # Hardcoded here
-                is_causal=self.is_causal,
-            )
-            attn_output = attn_output.reshape(
-                bsz, q_len, -1
-            ).contiguous()
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            position_ids=position_ids,
+            dropout=dropout_rate,
+            sliding_window=None, # Hardcoded here
+            is_causal=self.is_causal,
+        )
+        attn_output = attn_output.reshape(
+            bsz, q_len, -1
+        ).contiguous()
 
         # TODO: Consider to delete the following 3 lines.
         attn_weights = None
@@ -268,18 +258,6 @@ class Qwen2MemFlexAttn(Qwen2Attention):
             attn_weights = None # FlashAttention doesn't return attention weights
 
         hidden_states = self.o_proj(attn_output)
-
-        if enable_ahn:
-            return (
-                hidden_states,
-                attn_weights,
-                attn_output,
-                (
-                    query_states,
-                    key_states,
-                    value_states,
-                ),
-            )
 
         return hidden_states, attn_weights, attn_output
 
@@ -560,11 +538,7 @@ class Qwen2Model(Qwen2Model_):
                 past_key_values = DynamicCache()
             else:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                # logger.warning_once(
-                #     "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
-                #     "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
-                #     "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
-                # )
+
         
         if use_cache and not isinstance(mem_past_key_values, MemCache):
             if mem_past_key_values is None:

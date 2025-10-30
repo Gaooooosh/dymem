@@ -7,12 +7,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Register custom Qwen layers that add AHN support.
-from ahn.transformer.qwen2_ahn import register_customized_qwen2
-from ahn.transformer.qwen3_ahn import register_customized_qwen3
+from dymem.transformer.qwen2_dymem import register_customized_qwen2
 
 register_customized_qwen2()
-register_customized_qwen3()
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Load base model + AHN weights and run a sample generation.")

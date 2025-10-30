@@ -14,8 +14,8 @@ from llamafactory.train.tuner import run_exp
 
 def main():
     # Customized models
-    from ahn.transformer.qwen2_ahn import register_customized_qwen2
-    from ahn.transformer.qwen3_ahn import register_customized_qwen3
+    from dymem.transformer.qwen2_ahn import register_customized_qwen2
+    from dymem.transformer.qwen3_ahn import register_customized_qwen3
     
     register_customized_qwen2()
     register_customized_qwen3()
