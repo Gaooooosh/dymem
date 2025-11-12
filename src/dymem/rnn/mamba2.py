@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fla.modules.layernorm import RMSNorm
 from transformers.utils import logging
 
 from ..utils import GroupLinear
@@ -109,6 +110,19 @@ def segment_sum(input_tensor):
     return tensor_segsum
 
 
+def _ensure_cuda(name, t):
+    if t is None: 
+        return
+    assert t.is_cuda, f"{name} is on {t.device}, expected CUDA"
+
+def _finite_stats(name, t):
+    with torch.no_grad():
+        print(f"[{name}] shape={tuple(t.shape)} dtype={t.dtype} "
+              f"min={float(t.min()) if t.numel() else float('nan'):.4g} "
+              f"max={float(t.max()) if t.numel() else float('nan'):.4g} "
+              f"mean={float(t.mean()) if t.numel() else float('nan'):.4g} "
+              f"NaN={int(torch.isnan(t).sum())} Inf={int(torch.isinf(t).sum())}")
+
 class Mamba2(nn.Module):
     """
     Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
@@ -166,14 +180,17 @@ class Mamba2(nn.Module):
         self.norm = RMSNormGated(
             self.num_heads * self.head_dim, eps=self.norm_eps, norm_before_gate=False
         )
-        # self.D = nn.Parameter(torch.ones(self.num_heads))
-        # self.D._no_weight_decay = True
+        # self.norm = RMSNorm(self.num_heads * self.head_dim, eps=self.norm_eps)
+        # self.norm = nn.LayerNorm(self.num_heads * self.head_dim, eps=self.norm_eps)
+        self.D = nn.Parameter(torch.ones(self.num_heads))
+        self.D._no_weight_decay = True
         self.layer_idx = layer_idx
 
         self.dt_proj = nn.Linear(hidden_size, self.num_heads, bias=True)
         self.g_proj = nn.Linear(hidden_size, self.num_heads, bias=True)
         self.o_proj = GroupLinear(self.num_heads * self.head_dim, self.num_heads * self.head_dim, self.num_heads)
-
+        if self.time_step_limit == (0.0, float("inf")):
+            self.time_step_limit = (self.time_step_min, self.time_step_max)
         if not is_fast_path_available:
             logger.warning_once(
                 "The fast path is not available because one of "
@@ -183,134 +200,63 @@ class Mamba2(nn.Module):
             )
 
     def get_beta_alpha(self, hidden_states: torch.Tensor):
-        dt = self.dt_proj(hidden_states) 
-        beta = dt
+        # 遵循输入 dtype，不强制转换为 FP32
+        beta = self.dt_proj(hidden_states)
         return beta, None
 
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        q_states: torch.Tensor,
-        k_states: torch.Tensor,
-        v_states: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs: Unpack[Dict],
-    ):
-        last_state = None
-        if past_key_values is not None and len(past_key_values) > self.layer_idx:
-            last_state = past_key_values[self.layer_idx]
-        recurrent_state = (
-            last_state["recurrent_state"] if last_state is not None else None
-        )
-        # 1. Gated MLP's linear projection
-        # hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        # projected_states = self.in_proj(hidden_states)
-
-        # Set up dimensions for reshapes later
-        # batch_size, seq_len, _ = hidden_states.shape
-        batch_size, seq_len, _, _ = q_states.shape
-
-        q_states = F.normalize(q_states, p=2, dim=-1)
-        k_states = F.normalize(k_states, p=2, dim=-1)
-        B = k_states
-        C = q_states
-
-        hidden_states_ab, hidden_states_g = hidden_states
+        recurrent_state: Optional[torch.Tensor] = None,
+        **kwargs: Dict,
+    ) -> torch.Tensor:
+        Batch, T, _ = hidden_states.shape
         
-        if self.training:
-            dt = self.dt_proj(hidden_states_ab)
-        else:
-            dt = hidden_states_ab["beta"]
+        # Normalize the hidden states (if needed)
+        # Compute dt for state update
+        dt = self.dt_proj(hidden_states)  # Compute time step # [B,T,H]
 
-        gate = self.g_proj(hidden_states_g).repeat_interleave(self.head_dim, dim=-1) # [batch, seq, num_heads * head_dim]
+        # Gate projection
+        gate = torch.tanh(self.g_proj(hidden_states)).repeat_interleave(self.head_dim, dim=-1)
 
+        A = -torch.exp(self.A_log)  # (nheads,)
 
-        hidden_states = v_states
+        # Repeat time step and bias for the state update
+        # dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+        # Prepare states for transformation (B, C)
+        B = hidden_states.view(Batch, T, self.num_heads, self.head_dim).contiguous()
+        C = hidden_states.view(Batch, T, self.num_heads, self.head_dim).contiguous()
 
         # Single step calculations via cache
         # if cache_params is not None and cache_position is not None and cache_position[0] > 0:
-        if seq_len == 1 and recurrent_state is not None: # hardcode here, assuming training seq is always > 1
-
-            # squeeze seq dim
-            dt = dt.squeeze(1) # [Batch, num_heads]
-            gate = gate.squeeze(1) # [Batch, num_heads * head_dim]
-
-            # 3. SSM transformation
-            A = -torch.exp(self.A_log.float())  # (nheads,)
-            A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.head_dim).to(dtype=torch.float32)
-            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
-            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
-            # D = self.D[:, None, ...].expand(-1, self.head_dim)
-            B = B.view(batch_size, self.num_heads, self.head_dim)
-            C = C.view(batch_size, self.num_heads, self.head_dim)
-            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
-
-            assert recurrent_state is not None, "Recurrent state is required for single step Mamba2"
-            hidden_states = selective_state_update(
-                recurrent_state, # cache_params.ssm_states[self.layer_idx],
-                hidden_states_reshaped,
+        if T == 1 and recurrent_state is not None: # hardcode here, assuming training seq is always > 1
+            output = selective_state_update(
+                recurrent_state,
+                B,
+                dt,
+                A,
+                C,
+                D=self.D,
+                dt_bias=self.dt_bias
+            ) # out: (batch, dim) or (batch, nheads, dim)
+            out = out.unsqueeze(1) # (batch, 1, nheads, dim)
+            out = self.norm(out,gate)
+        # Fused calculations or step by step if no initialized cache is found
+        else:
+            output = mamba_chunk_scan_combined(
+                hidden_states.view(Batch, T, self.num_heads, self.head_dim).contiguous(),
                 dt,
                 A,
                 B,
                 C,
-                D=None, # D,
-                z=None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-            )
-            hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
-            hidden_states = self.norm(hidden_states, gate)
-
-            # unsequeeze because GroupLinear only supports shape of [B, S, dim]
-            hidden_states = hidden_states.unsqueeze(1)
-            # 4. Final linear projection
-            # out = self.out_proj(hidden_states)[:, None, ...]
-            out = self.o_proj(hidden_states)
-
-        # Fused calculations or step by step if no initialized cache is found
-        else:
-            A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
-            dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
-
-
-            # 3. SSM transformation
-
-            scan_output, ssm_state = mamba_chunk_scan_combined(
-                hidden_states, # hidden_states.view(batch_size, seq_len, -1, self.head_dim),
-                dt,
-                A,
-                B, # B.view(batch_size, seq_len, self.n_groups, -1),
-                C, # C.view(batch_size, seq_len, self.n_groups, -1),
                 chunk_size=self.chunk_size,
-                D=None, # self.D,
-                z=None,
-                seq_idx=None,
-                return_final_states=True,
+                D=self.D,
                 dt_bias=self.dt_bias,
-                initial_states=recurrent_state,
-                dt_softplus=True,
-                **dt_limit_kwargs,
-            )
-
-            # Init cache
-            # if ssm_state is not None and cache_params is not None:
-            #     cache_params.update_ssm_state(layer_idx=self.layer_idx, new_ssm_state=ssm_state)
-            if past_key_values is not None:
-                past_key_values.update(
-                    recurrent_state=ssm_state,
-                    conv_state=None,
-                    layer_idx=self.layer_idx,
-                    offset=seq_len,
-                )
-
-            scan_output = scan_output.view(batch_size, seq_len, -1)
-            # Multiply "gate" branch and apply extra normalization layer
-            scan_output = self.norm(scan_output, gate)
-
-            # 4. Final linear projection
-            out = self.o_proj(scan_output)
-        # return out
-        return out, None, past_key_values
+                return_final_states=True
+            ) # out: (batch, seqlen, nheads, headdim)
+            out = self.norm(out,gate)
+            out = out[:,-1,:,:] # (batch, 1, nheads, headdim)
+        # 4. Final linear projection
+        out = self.o_proj(out)
+        return out # (batch, 1, nheads, headdim)

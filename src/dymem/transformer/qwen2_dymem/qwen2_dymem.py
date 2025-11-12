@@ -15,6 +15,8 @@ from dymem.transformer.qwen2 import (
     Qwen2Model as Qwen2Model_,
     Qwen2ForCausalLM as Qwen2ForCausalLM_,
 )
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+
 from dymem.transformer.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2MLP,
@@ -24,17 +26,19 @@ from dymem.transformer.qwen2.modeling_qwen2 import (
     repeat_kv,
     apply_rotary_pos_emb,
     rotate_half,
+    eager_attention_forward,
 )
 
-from dymem.utils import BaseAHN, AHNRouter
-from dymem.rnn import Mamba2
+from dymem.utils import BaseAHN,repeat_memkv
+# from dymem.rnn import Mamba2
+from fla.layers.mamba2 import Mamba2
 from dataclasses import dataclass
-from fla.models.utils import Cache as MemCache
 from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
 from transformers.modeling_flash_attention_utils import _flash_attention_forward, FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.processing_utils import Unpack
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.utils import (
     ModelOutput,
     add_start_docstrings_to_model_forward,
@@ -44,7 +48,7 @@ from transformers.utils import (
     # deprecate_kwarg,
     logging,
 )
-
+from torch.nn.functional import scaled_dot_product_attention as sdpa
 logger = logging.get_logger(__name__)
 
 # FlexAttention configuration
@@ -131,6 +135,20 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.sliding_window = getattr(config, 'sliding_window', 256)
         self.mem_max_len = getattr(config, 'mem_max_len', 2048)
 
+        ahn_impl = getattr(config, '_ahn_implementation', None)
+        if ahn_impl is not None:
+            self.compressor = Mamba2(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                hidden_size=config.hidden_size,
+                state_size = 256,
+                expand = 1,
+                layer_idx=layer_idx,
+                n_groups=self.num_kv_groups,
+                chunk_size=64,
+                )
+        else:
+            self.compressor = None
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -141,46 +159,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
         self.recent_k = None  # [B,H,W,D]
         self.recent_v = None
-        self.recent_h = None  # [B,W,H]
-        self.recent_q = None  # [B,H,W,D]
-
-    # --------- 工具 ---------
-    @staticmethod
-    def _cat(parts: List[Optional[torch.Tensor]]):
-        parts = [p for p in parts if p is not None]
-        return torch.cat(parts, dim=2) if parts else None
-
-    def _set_active_from_o(self, o_last: torch.Tensor):
-        # o_last: [B,H]
-        x = o_last.unsqueeze(1)  # [B,1,H]
-        k_states = self.k_proj(x)
-        v_states = self.v_proj(x)
-        B, L1, _ = k_states.shape
-        # reshape to KV heads then repeat to attn heads
-        k_kv = k_states.view(B, L1, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v_kv = v_states.view(B, L1, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = repeat_kv(k_kv, self.num_kv_groups)
-        v = repeat_kv(v_kv, self.num_kv_groups)
-        self.active_k, self.active_v = k, v
-
-    def _solidify_active(self):
-        if self.active_k is None:
-            return
-        if self.mem_k is None:
-            self.mem_k, self.mem_v = self.active_k, self.active_v
-        else:
-            self.mem_k = torch.cat([self.mem_k, self.active_k], dim=2)
-            self.mem_v = torch.cat([self.mem_v, self.active_v], dim=2)
-        # 截断 mem 左端
-        if self.mem_k.size(2) > self.mem_max_len:
-            cut = self.mem_k.size(2) - self.mem_max_len
-            self.mem_k = self.mem_k[:, :, cut:, :].contiguous()
-            self.mem_v = self.mem_v[:, :, cut:, :].contiguous()
-        # 新建空 active
-        B, Hh, _, D = self.mem_k.shape
-        zeros_k = torch.zeros(B, Hh, 1, D, device=self.mem_k.device, dtype=self.mem_k.dtype)
-        zeros_v = torch.zeros(B, Hh, 1, D, device=self.mem_v.device, dtype=self.mem_v.dtype)
-        self.active_k, self.active_v = zeros_k, zeros_v
 
     def _build_block_mask(self, kv_len: int, q_len: int, device: torch.device):
         # 简化版：S/M/A 全可见；WINDOW 段长度受 recent 限制（不再对窗口做 q 相对因果限制，decode=1 安全）
@@ -200,88 +178,107 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         )
         return mask
 
-    # --------- 前向（推理） ---------
     def forward(
         self,
         prenormed_hidden: torch.Tensor,                                 # [B,T,H]
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (cos, sin) for new tokens
-        compressor: Optional[BaseAHN] = None,
-        do_solidify: bool = False,
-        is_decode: bool = True,
-    ) -> torch.Tensor:
+        past_key_value: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         B, T, H = prenormed_hidden.shape
-        # 线性投影
-        q_states = self.q_proj(prenormed_hidden)  # [B,T,H]
-        k_states = self.k_proj(prenormed_hidden)
-        v_states = self.v_proj(prenormed_hidden)
-        # 分头
-        q = q_states.view(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()  # [B,H,T,D]
-        # reshape k/v to KV heads then repeat to attn heads
-        k_kv = k_states.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()  # [B,K,T,D]
-        v_kv = v_states.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()  # [B,K,T,D]
-        k = repeat_kv(k_kv, self.num_kv_groups)  # [B,H,T,D]
-        v = repeat_kv(v_kv, self.num_kv_groups)  # [B,H,T,D]
-        # 对“新来的窗口段”应用 RoPE
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        # 维护 recent（k/q 已是旋转后的；v 不旋）
-        if self.recent_k is None:
-            self.recent_k, self.recent_v = k, v
-            self.recent_h, self.recent_q = prenormed_hidden, q
-        else:
-            self.recent_k = torch.cat([self.recent_k, k], dim=2)
-            self.recent_v = torch.cat([self.recent_v, v], dim=2)
-            self.recent_h = torch.cat([self.recent_h, prenormed_hidden], dim=1)
-            self.recent_q = torch.cat([self.recent_q, q], dim=2)
-        # 计算驱逐长度并喂给 AHN
-        overflow = max(0, (0 if self.recent_k is None else self.recent_k.size(2)) - self.sliding_window)
-        # print(f"overflow:{overflow}, Compressor:{compressor is not None}")
-        if overflow > 0 and compressor is not None:
-            print("use comporessor")
-            h_e = self.recent_h[:, :overflow, :].contiguous()
-            q_e = self.recent_q[:, :, :overflow, :].contiguous()
-            k_e = self.recent_k[:, :, :overflow, :].contiguous()
-            v_e = self.recent_v[:, :, :overflow, :].contiguous()
-            compressor.update_cache(h_e)
-            o, _ = compressor(hidden_states=h_e, q_states=q_e, k_states=k_e, v_states=v_e, use_cache=True, past_key_values=None)
-            self._set_active_from_o(o[:, -1, :])
-            # recent 左裁剪
-            self.recent_k = self.recent_k[:, :, overflow:, :].contiguous()
-            self.recent_v = self.recent_v[:, :, overflow:, :].contiguous()
-            self.recent_q = self.recent_q[:, :, overflow:, :].contiguous()
-            self.recent_h = self.recent_h[:, overflow:, :].contiguous()
-        # 固化 ACTIVE
-        if do_solidify:
-            self._solidify_active()
-        # 组装 K/V（prefill 屏蔽 MEM/ACTIVE；decode 启用）
-        mem_k = self.mem_k
-        mem_v = self.mem_v
-        act_k = self.active_k
-        act_v = self.active_v
-        if is_decode and position_embeddings is not None:
-            # 对 MEM/ACTIVE 的 K 做“查询时对齐”的 RoPE（以当前步角度广播到 mem 长度）
-            cos, sin = position_embeddings  # [B, T, D]
-            cos_t = cos[:, -1:, :]  # [B,1,D]
-            sin_t = sin[:, -1:, :]  # [B,1,D]
-            if mem_k is not None:
-                cos_mem = cos_t.expand(-1, mem_k.size(2), -1)  # [B,mem_len,D]
-                sin_mem = sin_t.expand(-1, mem_k.size(2), -1)
-                mem_k, _ = apply_rotary_pos_emb(mem_k, mem_k, cos_mem, sin_mem, unsqueeze_dim=1)
-            if act_k is not None:
-                act_k, _ = apply_rotary_pos_emb(act_k, act_k, cos_t, sin_t, unsqueeze_dim=1)
-        else:
-            mem_k = mem_v = None
-            act_k = act_v = None
-        K_total = self._cat([self.sink_k, mem_k, act_k, self.recent_k])
-        V_total = self._cat([self.sink_v, mem_v, act_v, self.recent_v])
-        KV_LEN = 0 if K_total is None else K_total.size(2)
-        # flex block mask（这里简化为全 True；recent 长度本身受限于窗口）
-        block_mask = self._build_block_mask(KV_LEN, T, device=q.device)
-        out = flex_attention(q, K_total, V_total, block_mask=block_mask)
-        out = out[:, :, :T, :].transpose(1, 2).contiguous().view(B, T, H)
-        return self.o_proj(out)
+        # 预填充阶段可能会更改序列长度，先处理压缩拼接，再计算投影视图形状
+        mem_out = None
+        if T > 1:
+            # prefilling
+            w = 0 if (self.sliding_window is None or self.sliding_window <= 0) else self.sliding_window
+            sink_len = min(self.num_attn_sinks, T)
+            keep_window_len = w
+            evict_end_index = max(0, T - keep_window_len)
+            overflow = max(0, evict_end_index - sink_len)
+            if self.compressor is not None and overflow > 0:
+                # 正确的被压缩段：去掉前端 sink 与末端滑窗，中间段作为被驱逐 token
+                evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    mem_out = self.compressor(
+                        evicted_hidden_states.float().contiguous(),
+                        cache_params=(getattr(past_key_value, "mem_cache", None) if past_key_value is not None else None),
+                        cache_position=cache_position,
+                    )  # [B, EVC_T, H]
+                mem_out = mem_out.to(dtype=prenormed_hidden.dtype, device=prenormed_hidden.device)
+                mem_act = mem_out[:, -1, :].unsqueeze(1)  # [B, 1, H]
 
+                prenormed_hidden = torch.cat(
+                    [
+                        prenormed_hidden[:, :sink_len, :],
+                        mem_act.to(prenormed_hidden.device),
+                        prenormed_hidden[:, evict_end_index:, :],  # 保留末端滑窗
+                    ],
+                    dim=1,
+                )
+                position_embeddings = (
+                    torch.cat([position_embeddings[0][:, :sink_len+1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
+                    torch.cat([position_embeddings[1][:, :sink_len+1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
+                )
+
+        # 压缩拼接后重新计算形状并保证连续性
+        B, T, H = prenormed_hidden.shape
+        input_shape = prenormed_hidden.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        prenormed_hidden = prenormed_hidden.contiguous()
+
+        # 线性投影
+        q_states = self.q_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2)
+        k_states = self.k_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2)
+        v_states = self.v_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            q_states.to(dtype=cos.dtype),
+            k_states.to(dtype=cos.dtype),
+            cos,
+            sin,
+        )
+        value_states = v_states
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+                logger.warning_once(
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # main diff with Llama
+            **kwargs,
+        )
+
+        # 将 [B, T, heads, head_dim] 转为 [B, T, heads*head_dim]
+        attn_output = attn_output.reshape(B, T, -1).contiguous()
+        if mem_out is not None:
+            attn_output = torch.cat([
+                attn_output[:, :sink_len, :],
+                mem_out.to(dtype=attn_output.dtype, device=attn_output.device),
+                attn_output[:, sink_len + 1 :, :]
+            ], dim=1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
 
 class Qwen2DyMemDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int):
@@ -292,13 +289,6 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        ahn_impl = getattr(config, '_ahn_implementation', None)
-        if ahn_impl is not None:
-            self.compressor = BaseAHN(ahn_cls=AHN_CLS[ahn_impl], layer_idx=layer_idx,
-                                    hidden_size=config.hidden_size, num_heads=config.num_attention_heads,
-                                    head_dim=config.hidden_size // config.num_attention_heads)
-        else:
-            self.compressor = None
         self._do_solidify_next = False
 
     def mark_solidify(self):
@@ -306,26 +296,45 @@ class Qwen2DyMemDecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,                 # [B,T,H]
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        past_key_value: Optional[object] = None,
-        use_cache: Optional[bool] = True,
-    ):
-        x = self.input_layernorm(hidden_states)
-        is_decode = True if (hidden_states.size(1) == 1) else False
-        attn_out = self.self_attn(
-            prenormed_hidden=x,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights = self.self_attn(
+            prenormed_hidden=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
             position_embeddings=position_embeddings,
-            compressor=self.compressor,
-            do_solidify=self._do_solidify_next,
-            is_decode=is_decode,
+            **kwargs,
         )
-        self._do_solidify_next = False
-        h = hidden_states + attn_out
-        h2 = self.post_attention_layernorm(h)
-        h2 = self.mlp(h2)
-        out = h + h2
-        return (out,)
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        return outputs
 
 
 
@@ -358,103 +367,6 @@ class Qwen2Model(Qwen2Model_):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
-
-    @staticmethod
-    def create_sparse_mask(sliding_window: int = 2048, num_attn_sinks: int = 0):
-
-        def ctx_sliding_window_mask(b, h, q_idx, kv_idx):
-            causal = q_idx >= kv_idx
-            sliding = (q_idx - kv_idx) < sliding_window
-            sink = kv_idx < num_attn_sinks
-            return causal & (sliding | sink)
-
-        return ctx_sliding_window_mask
-
-    def pre_model_forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None
-    ):
-        """
-        Build FlexAttention mask with custom sliding window and attention sink.
-        """
-        flex_attention_mask = None
-        if self.training and self.layer_cls == "Qwen2DyMemDecoderLayer":
-            B, L = input_ids.shape
-            sliding_window_type = getattr(self.config, "sliding_window_type", "fixed")
-            sliding_window = getattr(self.config, "sliding_window", None)
-            assert (
-                sliding_window > 0
-            ), "Please provide 'sliding_window' for 'Qwen2DyMemDecoderLayer' forward pass."
-
-            # Get sliding window
-            if sliding_window_type == "fixed":
-                self.config.dy_sliding_window = sliding_window
-            elif sliding_window_type == "linear":
-                # Grow with sequence length but lower-bounded
-                self.config.dy_sliding_window = max(L // 4, 512)
-            elif sliding_window_type == "random":
-                def sample_window_size(
-                    seq_len: str,
-                    candidates: list = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
-                ):
-                    valid_sizes = [c for c in candidates if seq_len / 8 < c < seq_len]
-                    return random.choice(valid_sizes)
-                random_size = sample_window_size(L)
-                self.config.dy_sliding_window = random_size
-            else:
-                raise NotImplementedError
-
-            # Get attention sink
-            sliding_window = getattr(
-                self.config, "dy_sliding_window", self.config.sliding_window
-            )
-            ahn_position = getattr(self.config, "ahn_position", "prefix")
-
-            if ahn_position == "prefix":
-                num_attn_sinks = 0
-            elif ahn_position == "random":
-                def sample_num_attn_sinks(
-                    sliding_window: int,
-                    candidates: list = [0, 32, 64, 128, 512, 2048, 4096],
-                ):
-                    valid_sizes = [c for c in candidates if c <= 0.5 * sliding_window]
-                    return random.choice(valid_sizes)
-                num_attn_sinks = sample_num_attn_sinks(sliding_window)
-                self.config.dy_num_attn_sinks = num_attn_sinks
-                sliding_window = sliding_window - num_attn_sinks
-            else:
-                raise NotImplementedError
-        else:
-            sliding_window = getattr(self.config, "sliding_window", None)
-            num_attn_sinks = getattr(self.config, "num_attn_sinks", 0)
-            assert (
-                sliding_window > 0
-            ), "Please provide 'sliding_window' for 'Qwen2MemDecoderLayer' forward pass."
-
-        # Generate FlexAttention mask
-        # TODO(XIAO):添加与mem_token数量匹配的sliding_window数量
-        sparse_mask = self.create_sparse_mask(
-            sliding_window=sliding_window, num_attn_sinks=num_attn_sinks
-        )
-        
-        seq_len = input_ids.shape[1]
-        padded_lens = [2048, 4096, 8192, 16384, 24576, 32768]
-        padded_seq_len = next(
-            (l for l in padded_lens if l >= seq_len), (seq_len // 128 + 1) * 128
-        )
-
-        flex_attention_mask = create_block_mask(
-            sparse_mask,
-            B=1,
-            H=self.config.num_attention_heads,
-            Q_LEN=padded_seq_len,
-            KV_LEN=padded_seq_len,
-            device=input_ids.device,
-            BLOCK_SIZE=128,
-            _compile=True,
-        )
-
-        return flex_attention_mask
 
     @can_return_tuple
     def forward(
@@ -494,6 +406,15 @@ class Qwen2Model(Qwen2Model_):
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
+            # Attach a memory cache for compressor usage if available
+            try:
+                from fla.models.mamba2.modeling_mamba2 import Mamba2Cache
+                if not hasattr(past_key_values, "mem_cache"):
+                    past_key_values.mem_cache = Mamba2Cache()
+            except Exception:
+                # Fallback: ensure attribute exists to avoid AttributeError; compressor will ignore None
+                if not hasattr(past_key_values, "mem_cache"):
+                    past_key_values.mem_cache = None
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -512,7 +433,11 @@ class Qwen2Model(Qwen2Model_):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-
+        if self.training:
+            self.sliding_window = random.choice(self.config.windows_choices)
+        else:
+            self.sliding_window = self.config.sliding_window
+            # print(f"sliding_window: {self.sliding_window}")
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -540,158 +465,6 @@ class Qwen2Model(Qwen2Model_):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool = False,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and past_key_values is not None:
-                is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
-                if is_padding_right:
-                    raise ValueError(
-                        "You are attempting to perform batched generation with padding_side='right'"
-                        " this may lead to unexpected behaviour for Flash Attention version of Qwen2. Make sure to "
-                        " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-                    )
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-        using_sliding_window_cache = isinstance(past_key_values, SlidingWindowCache)
-
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if (
-            self.config._attn_implementation == "sdpa"
-            and not (using_static_cache or using_sliding_window_cache)
-            and not output_attentions
-        ):
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                sliding_window=self.config.sliding_window,
-                is_training=self.training,
-            ):
-                return None
-
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        # SlidingWindowCache or StaticCache
-        if using_sliding_window_cache or using_static_cache:
-            target_length = past_key_values.get_max_cache_shape()
-        # DynamicCache or no cache
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            device=device,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-            config=self.config,
-            past_key_values=past_key_values,
-        )
-
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu"]
-            and not output_attentions
-        ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        config: Qwen2Config,
-        past_key_values: Cache,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            device (`torch.device`):
-                The device to place the 4D attention mask on.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-            config (`Qwen2Config`):
-                The model's configuration class
-            past_key_values (`Cache`):
-                The cache class that is being used currently to generate
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            )
-            diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            if config.sliding_window is not None:
-                # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
-                # the check is needed to verify is current checkpoint was trained with sliding window or not
-                if not isinstance(past_key_values, SlidingWindowCache) or sequence_length > target_length:
-                    sliding_attend_mask = torch.arange(target_length, device=device) <= (
-                        cache_position.reshape(-1, 1) - config.sliding_window
-                    )
-                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                if attention_mask.shape[-1] > target_length:
-                    attention_mask = attention_mask[:, :target_length]
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-        return causal_mask
 
 class Qwen2ForCausalLM(Qwen2ForCausalLM_):
     _tied_weights_keys = ["lm_head.weight"]

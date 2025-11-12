@@ -1,55 +1,39 @@
 # test_qwen2_5_dymem_infer.py
+import os
+os.environ.setdefault("TRITON_DISABLE_AUTOTUNING", "1")
+os.environ.setdefault("TRITON_DISABLE_TUNING_CACHE", "1")
+os.environ.setdefault("TRITON_MAX_CL_NUM_WARPS", "4")
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-
 from dymem.transformer.qwen2_dymem import register_customized_qwen2, Qwen2Config, Qwen2ForCausalLM
 
 register_customized_qwen2(exist_ok=True)
 BASE_ID = "Qwen/Qwen2.5-3B-Instruct"  # 预训练基座
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+device = torch.device("cuda:1")
+# 保证 Triton 在正确的 CUDA 设备上运行
+if torch.cuda.is_available():
+    torch.cuda.set_device(device)
 # ==== 2) 取预训练配置，并构造你的自定义配置 ====
 base_cfg = AutoConfig.from_pretrained(BASE_ID)
 cfg_dict = base_cfg.to_dict()
+cfg_dict['sliding_window']=512
 # 关键：切换到你的解码层 & 压缩器实现（默认 Mamba2），并开启滑窗/记忆等参数
 cfg = Qwen2Config(
     **cfg_dict,
 )
 # ==== 3) 构建你的模型骨架 ==== 
-model = Qwen2ForCausalLM(cfg)
-model.to(dtype=DTYPE, device=DEVICE)
+model = Qwen2ForCausalLM(cfg).to(device)
 model.eval()
 
-# ==== 4) 加载预训练权重到能对齐的模块（其余新模块保持随机初始化）====
-# 做法：先用官方结构加载一个同尺寸的基座，再把 state_dict 转灌到自定义模型，strict=False
-with torch.device("meta"):  # 避免重复分配显存（可选优化）
-    pass
 
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_ID, torch_dtype=DTYPE, device_map=None
-)
-missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
-del base_model  # 释放显存/内存
+# base_model = AutoModelForCausalLM.from_pretrained(BASE_ID).to(device)
+# missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+# del base_model  # 释放显存/内存
 
-print("[load_state_dict] missing:", len(missing), "unexpected:", len(unexpected))
+# print("[load_state_dict] missing:", len(missing), "unexpected:", len(unexpected))
 # 预期：missing 主要是你新增的 DyMem / AHN / flex-attn 相关权重；unexpected 通常为 0 或少量命名差异  :contentReference[oaicite:5]{index=5}
-
-# ==== 5) 冻结预训练层参数，只保留压缩器(AHN)等新模块可训练 ====
-trainable_keywords = [
-    "compressor",          # 你的 AHN 压缩器封装在每层 decoder 里  :contentReference[oaicite:6]{index=6}
-    "ChunkDecisionHead", # 若你后续启用了决策头（当前实现注释为 MVP），可按需放开  :contentReference[oaicite:7]{index=7}
-]
-
-for n, p in model.named_parameters():
-    if any(k in n for k in trainable_keywords):
-        p.requires_grad = True
-    else:
-        p.requires_grad = False
-
-frozen = sum(int(not p.requires_grad) for p in model.parameters())
-trainable = sum(int(p.requires_grad) for p in model.parameters())
-print(f"[freeze] frozen params: {frozen}, trainable params: {trainable}")
 
 # ==== 6) Tokenizer ====
 tok = AutoTokenizer.from_pretrained(BASE_ID, use_fast=True)
@@ -59,8 +43,7 @@ if tok.pad_token is None:
 print(cfg)
 
 # ==== 7) 推理测试（单条生成）====
-prompt = """
-非常好，这一步是理解并复用「记忆增强长上下文模型」的关键。下面我给出一份**系统的思路总结与实现要点清单**，帮助你掌握这类模型（如 Qwen2+AHN、MemGPT、RetNet、Mamba 等）在架构与训练实现上的核心逻辑，从而能**在你自己的模型中复现和改造**。
+prompt = """非常好，这一步是理解并复用「记忆增强长上下文模型」的关键。下面我给出一份**系统的思路总结与实现要点清单**，帮助你掌握这类模型（如 Qwen2+AHN、MemGPT、RetNet、Mamba 等）在架构与训练实现上的核心逻辑，从而能**在你自己的模型中复现和改造**。
 
 ---
 
@@ -291,7 +274,7 @@ Only AHN / Router get gradients
   你希望我下一步帮你做哪个？
 
 """
-inputs = tok(prompt, return_tensors="pt").to(DEVICE)
+inputs = tok(prompt, return_tensors="pt").to(device)
 
 with torch.no_grad():
     gen_ids = model.generate(

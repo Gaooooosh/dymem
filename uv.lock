@@ -278,6 +278,26 @@ wheels = [
 ]
 
 [[package]]
+name = "causal-conv1d"
+version = "1.5.4"
+source = { path = "causal_conv1d-1.5.4+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+dependencies = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+wheels = [
+    { filename = "causal_conv1d-1.5.4+cu12torch2.8cxx11abitrue-cp312-cp312-linux_x86_64.whl", hash = "sha256:c62338f9b3a914d79326e0f5c127361d6d7f8add87e896d01beb8291c95aa745" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+
+[[package]]
 name = "certifi"
 version = "2025.10.5"
 source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
@@ -497,13 +517,17 @@ name = "dymem"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "causal-conv1d" },
     { name = "datasets" },
     { name = "deepspeed" },
     { name = "evaluate" },
+    { name = "flash-attention" },
     { name = "flash-attn" },
+    { name = "flash-linear-attention" },
     { name = "huggingface-hub" },
     { name = "jieba" },
     { name = "llamafactory" },
+    { name = "mamba-ssm", extra = ["causal-conv1d"] },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "torch" },
@@ -512,15 +536,24 @@ dependencies = [
     { name = "wandb" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "dymem" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "causal-conv1d", path = "causal_conv1d-1.5.4+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
     { name = "datasets", specifier = ">=4.2.0" },
     { name = "deepspeed", specifier = ">=0.18.0" },
     { name = "evaluate", specifier = ">=0.4.6" },
-    { name = "flash-attn", path = "flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-attention", specifier = ">=1.0.0" },
+    { name = "flash-attn", path = "flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" },
+    { name = "flash-linear-attention", specifier = ">=0.4.0" },
     { name = "huggingface-hub", specifier = ">=0.35.3" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "llamafactory", specifier = ">=0.8.2" },
+    { name = "mamba-ssm", extras = ["causal-conv1d"], specifier = ">=2.2.6.post3" },
     { name = "matplotlib", specifier = ">=3.10.7" },
     { name = "numpy", specifier = ">=2.3.4" },
     { name = "torch", specifier = ">=2.9.0" },
@@ -528,6 +561,9 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "wandb", specifier = ">=0.22.2" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "dymem", virtual = "." }]
 
 [[package]]
 name = "einops"
@@ -606,21 +642,55 @@ wheels = [
 ]
 
 [[package]]
+name = "fla-core"
+version = "0.4.0"
+source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "torch" },
+]
+sdist = { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/db/3d/79a9d5c8cd973c86f35403931031787dfc6cc97d838a42d4c62e8cbbb66f/fla_core-0.4.0.tar.gz", hash = "sha256:d975022b074e97bfd086dc6b767dccb35e27a9fe36f26f3b26b1c2b68b36a1c8" }
+wheels = [
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/d5/0c/d52ab65e9c163631895052d70d4111f8530ca52f45beb0895378d1a2a8b5/fla_core-0.4.0-py3-none-any.whl", hash = "sha256:5396f36a9838c99f9e45c70e88e2e0b26688f719d07d2ddd61be16d29327f4ea" },
+]
+
+[[package]]
+name = "flash-attention"
+version = "1.0.0"
+source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
+wheels = [
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/7c/62/a3ffe7a541645e72298f055ec894bc5b9d890ec7cacbf068c7734e2c0998/flash_attention-1.0.0-py3-none-any.whl", hash = "sha256:9f8293b16dda6e46149cf73631158c40afec1393db66698fa45f8ba4b64b5f3e" },
+]
+
+[[package]]
 name = "flash-attn"
 version = "2.8.3"
-source = { path = "flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+source = { path = "flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "torch" },
 ]
 wheels = [
-    { filename = "flash_attn-2.8.3+cu12torch2.8cxx11abitrue-cp312-cp312-linux_x86_64.whl", hash = "sha256:f25da18657a87fc83dc1bfb8b7751b82246e9db355510226b674fd437c34b5fb" },
+    { filename = "flash_attn-2.8.3+cu12torch2.8cxx11abifalse-cp312-cp312-linux_x86_64.whl", hash = "sha256:2605b2653e7b9d6615bbb154896ae4d3f0b95d3120af7a6374ee97092e61df02" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "einops" },
     { name = "torch" },
+]
+
+[[package]]
+name = "flash-linear-attention"
+version = "0.4.0"
+source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
+dependencies = [
+    { name = "fla-core" },
+    { name = "transformers" },
+]
+sdist = { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/44/9a/e546815da2bf149e0af58449ff1ca10074165af4384febead438ad46f74c/flash_linear_attention-0.4.0.tar.gz", hash = "sha256:c5d2bf6e1a766af3a4426f07f710b0b87809f7218de21eb313314be6ff1b0dba" }
+wheels = [
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/3c/76/4f716c953608204c970de7cd4045db1af02643d7f19c94a49254834b7563/flash_linear_attention-0.4.0-py3-none-any.whl", hash = "sha256:50c97163f7cb64dc53585194ef36af44d2a6bc545227c4f73bb3ba9062630f1a" },
 ]
 
 [[package]]
@@ -1065,6 +1135,26 @@ dependencies = [
 sdist = { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/19/dd/95fa620a10145c5ab1a22522caacaac1b607c85f2630c692e84574e36b9b/llamafactory-0.8.2.tar.gz", hash = "sha256:96e5c0fd14d623eba31c84f6c6528a66782eb0d8e8d4f2c75e9a5f9bf571c085" }
 wheels = [
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/98/35/d1a9d2c8b63b81826a32b09b63192a08160a5d47483a647457f840d1778f/llamafactory-0.8.2-py3-none-any.whl", hash = "sha256:65bc2a03f62f1c52417637c428b8a4f5efc8bd5e719ddd30fcd52b2f1ff37378" },
+]
+
+[[package]]
+name = "mamba-ssm"
+version = "2.2.6.post3"
+source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "setuptools" },
+    { name = "torch" },
+    { name = "transformers" },
+    { name = "triton" },
+]
+sdist = { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/b6/0c/9373a469ff7a33bdd0644e55fa45165ba3900274dcf7fe9f10ccc232aef9/mamba_ssm-2.2.6.post3.tar.gz", hash = "sha256:826a3cdb651959f191dac64502f8a29627d9116fe6bb7c57e4f562da1aea7bf3" }
+
+[package.optional-dependencies]
+causal-conv1d = [
+    { name = "causal-conv1d" },
 ]
 
 [[package]]
@@ -2714,10 +2804,15 @@ name = "triton"
 version = "3.5.0"
 source = { registry = "https://mirrors.sustech.edu.cn/pypi/web/simple" }
 wheels = [
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/87/9b/30988039e1e84df7554fba24e6a734d2d0e847af33cabdf9b532b3c51456/triton-3.5.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:7da21fccceafc163e3a5e857abe34351ef76345af06cabf9637a914742671f0b" },
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/f5/3a/e991574f3102147b642e49637e0281e9bb7c4ba254edb2bab78247c85e01/triton-3.5.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c9e71db82261c4ffa3921cd050cd5faa18322d2d405c30eb56084afaff3b0833" },
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/cd/85/e37f1197acb04c8f3d83851d23d5d6ed5060ef74580668b112e23fdfa203/triton-3.5.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:188da5b81fa2f8322c27fec1627703eac24cb9bb7ab0dfbe9925973bc1b070d3" },
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/6c/29/10728de8a6e932e517c10773486b8e99f85d1b1d9dd87d9a9616e1fef4a1/triton-3.5.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e6bb9aa5519c084a333acdba443789e50012a4b851cd486c54f0b8dc2a8d3a12" },
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/b8/1d/38258f05010ac17a7b058c022911c9cae6526e149b7397134a048cf5a6c2/triton-3.5.0-cp313-cp313t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:03127d9b33aaf979c856676b394bc059ec1d68cb6da68ae03f62dd8ad77a04ae" },
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/5c/38/db80e48b9220c9bce872b0f616ad0446cdf554a40b85c7865cbca99ab3c2/triton-3.5.0-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c83f2343e1a220a716c7b3ab9fccfcbe3ad4020d189549200e2d2e8d5868bed9" },
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/91/fe/8f5771d00227f4eb1ee034f218ed427102b989366d2275fe3b3c105a3921/triton-3.5.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:468936651d383f4a6d10068d34a627505e13af55be5d002b9f27b987e7a5f0ac" },
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/ff/60/1810655d1d856c9a4fcc90ee8966d85f552d98c53a6589f95ab2cbe27bb8/triton-3.5.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:da0fa67ccd76c3dcfb0bffe1b1c57c685136a6bd33d141c24d9655d4185b1289" },
+    { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/78/59/99edd103958fe6e42b50b9ad8ce4f223ddf4ccf475259cf7d2b53381dc6c/triton-3.5.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c7ceef21410229ac23173a28eee5cfc0e37c1dfdb8b4bc11ecda2e3ecec7c686" },
     { url = "https://mirrors.sustech.edu.cn/pypi/web/packages/fb/b7/1dec8433ac604c061173d0589d99217fe7bf90a70bdc375e745d044b8aad/triton-3.5.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:317fe477ea8fd4524a6a8c499fb0a36984a56d0b75bf9c9cb6133a1c56d5a6e7" },
 ]
 

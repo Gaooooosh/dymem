@@ -5,13 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "causal-conv1d",
     "datasets>=4.2.0",
     "deepspeed>=0.18.0",
     "evaluate>=0.4.6",
+    "flash-attention>=1.0.0",
     "flash-attn",
+    "flash-linear-attention>=0.4.0",
     "huggingface-hub>=0.35.3",
     "jieba>=0.42.1",
     "llamafactory>=0.8.2",
+    "mamba-ssm[causal-conv1d]>=2.2.6.post3",
     "matplotlib>=3.10.7",
     "numpy>=2.3.4",
     "torch>=2.9.0",
@@ -34,4 +38,11 @@ members = [
 ]
 
 [tool.uv.sources]
-flash-attn = { path = "flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+dymem = { workspace = true }
+causal-conv1d = { path = "causal_conv1d-1.5.4+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+flash-attn = { path = "flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+
+[dependency-groups]
+dev = [
+    "dymem",
+]

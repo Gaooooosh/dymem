@@ -6,7 +6,7 @@ import torch.nn as nn
 
 from typing import Optional
 from transformers.cache_utils import Cache
-
+from fla.models.utils import Cache as MemCache
 def register_custom_accelerator():
     from accelerate import Accelerator
 
@@ -24,6 +24,18 @@ def register_custom_accelerator():
 
     # Replace the original method
     Accelerator.backward = new_backward
+
+
+def repeat_memkv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    return torch.repeat_interleave(hidden_states, dim=2, repeats=n_rep)
+
 
 
 class GroupLinear(nn.Module):
@@ -78,6 +90,10 @@ class GroupLinear(nn.Module):
         )  # (B, L, out_features)
         return out
 
+class CacheWithMem(Cache):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mem_cache = MemCache(*args, **kwargs)
 
 class BaseAHN(nn.Module):
     def __init__(
@@ -101,112 +117,18 @@ class BaseAHN(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             mode=mode,
-            expand_v=1,
+            expand=1,
             **kwargs
         )
-        self.num_cached_tokens = 0  # Cached K/V token count
-        self.ahn_cache = {}  # Keys: hidden_states, beta, alpha
+        self.cache = None  # Keys: recurrent_states
 
-    def update_cache(self, hidden_states: torch.Tensor):
-        # Store the gate values only
-        beta, alpha = self.fn.get_beta_alpha(hidden_states)
-        if not self.ahn_cache:
-            self.ahn_cache = {
-                "beta": beta,
-                "alpha": alpha,
-            }
-        else:
-            self.ahn_cache = {
-                "beta": torch.cat([self.ahn_cache["beta"], beta], dim=1),
-                "alpha": torch.cat([self.ahn_cache["alpha"], alpha], dim=1) if alpha is not None else alpha,
-            }
-
-    def query_cache(self, num_attn_sinks: int, num_cached_toekns: int):
-        memory_cache = self.ahn_cache
-        gate_values = {
-            "beta": memory_cache["beta"][
-                :, num_attn_sinks : num_attn_sinks + num_cached_toekns, ...
-            ],
-            "alpha": memory_cache["alpha"][
-                :, num_attn_sinks : num_attn_sinks + num_cached_toekns, ...
-            ] if memory_cache["alpha"] is not None else None,
-        }
-
-        return gate_values
-
-    def trim_cache(self, num_attn_sinks: int, num_cached_tokens: int):
-        memory_cache = self.ahn_cache
-        memory_cache["beta"] = torch.concat(
-            [
-                memory_cache["beta"][:, :num_attn_sinks, ...],
-                memory_cache["beta"][:, num_attn_sinks + num_cached_tokens :, ...],
-            ],
-            dim=-2,
-        ).contiguous()
-        memory_cache["alpha"] = torch.concat(
-            [
-                memory_cache["alpha"][:, :num_attn_sinks, ...],
-                memory_cache["alpha"][:, num_attn_sinks + num_cached_tokens :, ...],
-            ],
-            dim=-2,
-        ).contiguous() if memory_cache["alpha"] is not None else None
-
-    def reset_cache(self):
-        self.num_cached_tokens = 0
-        self.ahn_cache = {}
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        q_states: torch.Tensor,
-        k_states: torch.Tensor,
-        v_states: torch.Tensor,
-        use_cache: bool = False,
-        past_key_values: Optional[Cache] = None,
+        recurrent_states: Optional[torch.Tensor] = None,
     ):
-        o, _, past_key_values = self.fn(
-            layer_idx=self.layer_idx,
+        return self.fn(
             hidden_states=hidden_states,
-            q_states=q_states,
-            k_states=k_states,
-            v_states=v_states,
-            use_cache=use_cache,
-            past_key_values=past_key_values,
+            recurrent_states=recurrent_states,
         )
-
-        if not self.training:
-            self.num_cached_tokens += o.shape[1]
-
-        return o, past_key_values
-
-class AHNRouter(nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, use_dimwise_pos: bool = False):
-        super().__init__()
-        self.H, self.D = num_heads, head_dim
-
-        self.alpha = nn.Parameter(torch.full((num_heads,), 0.2))  # slope
-        self.beta = nn.Parameter(torch.zeros(num_heads))  # bias
-
-        if use_dimwise_pos:
-            self.freq = nn.Parameter(  # fixed frequencies initialised as in RoPE
-                torch.randn(num_heads, head_dim) / math.sqrt(head_dim),
-                requires_grad=False,
-            )
-            self.scale = nn.Parameter(torch.zeros(num_heads, head_dim))  # learnable amp
-
-    def forward(
-        self, pos_ratio: torch.FloatTensor, h_mem: torch.Tensor, h_local: torch.Tensor
-    ):
-        B, L = h_mem.shape[:2]
-        H, D = self.H, self.D
-
-        log_r = torch.log(pos_ratio).unsqueeze(0).unsqueeze(-1)  # B L 1
-        pos = self.alpha * log_r + self.beta  # B L H
-
-        if hasattr(self, "freq"):  # dim-wise enrichment
-            sin_feature = torch.sin(log_r * self.freq)  # B L H D
-            pos += (sin_feature * self.scale).sum(-1)  # B L H
-
-        g = torch.sigmoid(pos).unsqueeze(-1)  # B L H 1
-        out = h_local.reshape(B, L, H, D) + g * h_mem.reshape(B, L, H, D)  # B L H D
-        return out.reshape(B, L, H * D).contiguous()
