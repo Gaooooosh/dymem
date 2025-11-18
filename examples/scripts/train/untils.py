@@ -9,6 +9,7 @@ untils.py
 """
 
 import os
+import json
 import torch
 from typing import Dict, List
 from transformers import (
@@ -101,6 +102,31 @@ def collect_compressor_state_dict(model: torch.nn.Module) -> Dict[str, torch.Ten
     full_sd = model.state_dict()
     return {k: v for k, v in full_sd.items() if ".compressor." in k}
 
+def collect_compressor_config(model: torch.nn.Module) -> Dict[str, object]:
+    cfg = getattr(model, "config", None)
+    out = {}
+    if cfg is not None:
+        def _get(name, default=None):
+            return getattr(cfg, name, default)
+        out.update({
+            "use_compressor": _get("use_compressor", True),
+            "layer_implementation": _get("_layer_implementation", None),
+            "ahn_implementation": _get("_ahn_implementation", None),
+            "sliding_window": _get("sliding_window", None),
+            "num_attn_sinks": _get("num_attn_sinks", None),
+            "mem_max_len": _get("mem_max_len", None),
+            "conv_kernel": _get("conv_kernel", None),
+            "state_size": _get("state_size", None),
+            "chunk_size": _get("chunk_size", None),
+            "dtype": str(_get("dtype", None)),
+            "windows_choices": _get("windows_choices", None),
+            "hidden_size": _get("hidden_size", None),
+            "num_attention_heads": _get("num_attention_heads", None),
+            "num_key_value_heads": _get("num_key_value_heads", None),
+            "num_hidden_layers": _get("num_hidden_layers", None),
+        })
+    return out
+
 
 def save_compressor_weights(model: torch.nn.Module, path_or_dir: str) -> str:
     """只保存 compressor 权重；返回保存路径。"""
@@ -108,14 +134,23 @@ def save_compressor_weights(model: torch.nn.Module, path_or_dir: str) -> str:
     if os.path.isdir(path_or_dir) or path_or_dir.endswith(os.sep):
         os.makedirs(path_or_dir, exist_ok=True)
         path = os.path.join(path_or_dir, "compressor.pt")
+        cfg_path = os.path.join(path_or_dir, "compressor_config.json")
     else:
         # 允许传入文件路径
         dirn = os.path.dirname(path_or_dir)
         if dirn:
             os.makedirs(dirn, exist_ok=True)
         path = path_or_dir
+        cfg_path = os.path.join(dirn if dirn else ".", "compressor_config.json")
     torch.save(sd, path)
     print(f"[save] compressor weights -> {path} ({len(sd)} tensors)")
+    try:
+        cfg = collect_compressor_config(model)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print(f"[save] compressor config -> {cfg_path}")
+    except Exception as e:
+        print(f"[save][warn] compressor config not saved: {e}")
     return path
 
 

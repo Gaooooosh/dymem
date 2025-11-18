@@ -156,6 +156,18 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.recent_k = None  # [B,H,W,D]
         self.recent_v = None
 
+    @staticmethod
+    def apply_rotary_emb_single(
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        unsqueeze_dim: int = 1,
+    ) -> torch.Tensor:
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        x_embed = (x * cos) + (rotate_half(x) * sin)
+        return x_embed
+
     def forward(
         self,
         prenormed_hidden: torch.Tensor,                                 # [B,T,H]
@@ -181,80 +193,86 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                 evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
                 with torch.amp.autocast(device_type="cuda",enabled=False):
                     mem_out = self.compressor(
-                        evicted_hidden_states.contiguous(),
+                        evicted_hidden_states,
                         cache_params=past_key_value.mem_cache if past_key_value is not None else None,
-                        cache_position=cache_position,
+                        cache_position=None,
                     )  # [B, EVC_T, H]
-                mem_act = mem_out[:, -1, :].unsqueeze(1)  # [B, 1, H]
+                mem_act = mem_out[:, -1:, :] # [B, 1, H]
 
                 if past_key_value is not None:
-                    past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len:, :], layer_idx=self.layer_idx)
+                    past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
+                    past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
 
                 prenormed_hidden = torch.cat(
                     [
-                        prenormed_hidden[:, :sink_len, :],
+                        prenormed_hidden[:, :sink_len + 1, :],
                         # mem_act.to(prenormed_hidden.device),
                         prenormed_hidden[:, evict_end_index:, :],  # 保留末端滑窗
                     ],
                     dim=1,
                 )
                 position_embeddings = (
-                    torch.cat([position_embeddings[0][:, :sink_len, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
-                    torch.cat([position_embeddings[1][:, :sink_len, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
+                    torch.cat([position_embeddings[0][:, :sink_len + 1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
+                    torch.cat([position_embeddings[1][:, :sink_len + 1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
                 )
 
             elif past_key_value is not None and T > sink_len:
                     past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len:, :], self.layer_idx)
 
         else:
+            # decode
             mem_act = None
             if past_key_value is not None:
-                cumulative_length = past_key_value.hidden_cache.layers[self.layer_idx].cumulative_length
-                is_full = cumulative_length >= self.max_cache_len
-                if is_full:
-                    evicted_token = past_key_value.hidden_cache.layers[self.layer_idx].keys[:, :, 0:, :].copy_()
-                    past_key_value.hidden_cache.update(prenormed_hidden, prenormed_hidden, self.layer_idx)
-                    if self.compressor is not None:
+                layer_cache = past_key_value.hidden_cache.layers[self.layer_idx]
+
+                # 2) 若需要，先压缩这些视图；跨回绕时顺序馈入压缩器即可
+                if self.compressor is not None:
+                    ev_views = layer_cache.eviction_slices(prenormed_hidden.shape[1])  # T==1 -> 1
+                    if ev_views:
                         with torch.amp.autocast(device_type="cuda", enabled=False):
-                            mem_out_step = self.compressor(
-                                evicted_token,
-                                cache_params=past_key_value.mem_cache,
-                                cache_position=cache_position,
-                            )
-                            mem_act = mem_out_step[:, -1, :].unsqueeze(1)
-                else:
-                    past_key_value.hidden_cache.update(prenormed_hidden, self.layer_idx)
+                            mem_out_step = None
+                            for evt in ev_views:
+                                # e: [B, evict_len, H]，为原缓存上的视图；不做 .copy_()
+                                mem_out_step = self.compressor(
+                                    evt,
+                                    cache_params=past_key_value.mem_cache if past_key_value is not None else None,
+                                    cache_position=cache_position,
+                                )
+                            mem_act = mem_out_step[:, -1:, :]  # [B, 1, H]
+
+                # 3) 最后再把新 token 写入缓存（O(1) 次数的切片 copy）
+                past_key_value.hidden_cache.update(prenormed_hidden, self.layer_idx)
                 
         # 压缩拼接后重新计算形状并保证连续性
-        B, T, H = prenormed_hidden.shape
+        B, T, H = prenormed_hidden.shape # prefilling stage: the len will be sliding_window + 1 when mem_act is not None, the extra one position is pre-alloc for mem_qkv
         input_shape = prenormed_hidden.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        prenormed_hidden = prenormed_hidden.contiguous()
 
         # 线性投影 
         q_states = self.q_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2) # [B, H, T, D]
         k_states = self.k_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2)
         v_states = self.v_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2)
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(q_states, k_states, cos, sin)
         value_states = v_states
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
+            
         if mem_act is not None:
+            sink_len = self.num_attn_sinks
             mem_hidden_shape = (B, 1, -1, self.head_dim)
-            mem_q = self.q_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
-            mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
-            mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
-            # mem_q, mem_k = apply_rotary_pos_emb(mem_q, mem_k, cos, sin)
-            query_states = torch.cat([query_states[:,:,:sink_len,:], mem_q, query_states[:,:,sink_len:,:]], dim=2)
-            key_states = torch.cat([key_states[:,:,:sink_len,:], mem_k, key_states[:,:,sink_len:,:]], dim=2)
-            value_states = torch.cat([value_states[:,:,:sink_len,:], mem_v, value_states[:,:,sink_len:,:]], dim=2)
-            T = T + 1
+            mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
+            mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
 
+            # mem_q, mem_k = apply_rotary_pos_emb(mem_q, mem_k, cos, sin)
+            key_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_k[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_k[:,:,0,:]
+            value_states[:,:,sink_len,:] = mem_v[:,:,0,:]
+            if T > 1:
+                mem_q = self.q_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
+                query_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_q[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_q[:,:,0,:]
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -279,8 +297,8 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         )
 
         # 将 [B, T, heads, head_dim] 转为 [B, T, heads*head_dim]
-        attn_output = attn_output.reshape(B, T, -1).contiguous()
-        if mem_act is not None:
+        attn_output = attn_output.reshape(B, T, -1)
+        if mem_out is not None:
             if T > 1:
                 attn_output = torch.cat([attn_output[:,:sink_len,:], mem_out, attn_output[:,sink_len+1:,:]], dim=1)
         attn_output = self.o_proj(attn_output)
@@ -305,7 +323,7 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[CacheWithMem] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -380,7 +398,7 @@ class Qwen2Model(Qwen2Model_):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[CacheWithMem] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -410,7 +428,7 @@ class Qwen2Model(Qwen2Model_):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
+        if use_cache and past_key_values is None and not self.training:
             past_key_values = CacheWithMem(self.config)
 
 
@@ -427,6 +445,9 @@ class Qwen2Model(Qwen2Model_):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -445,6 +466,7 @@ class Qwen2Model(Qwen2Model_):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                cache_position=cache_position,
             )
             hidden_states = layer_outputs[0]
 
@@ -502,7 +524,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[CacheWithMem] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,

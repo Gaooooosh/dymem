@@ -139,6 +139,7 @@ def parse_args():
     parser.add_argument("--mem_max_len", type=int, default=1024)
     parser.add_argument("--max_steps", type=int, default=-1,help="当使用 --streaming 时必须指定，或设置 --max_train_samples 让脚本自动估算。")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deepspeed", type=str, default=None)
 
     # 调试选项
     parser.add_argument("--debug_one_step", action="store_true", help="开启单步前向+反向调试，捕捉 compressor 引入的 NaN/Inf。")
@@ -212,13 +213,42 @@ class CompressorOnlyTrainer(Trainer):
     def save_model(self, output_dir: str = None, _internal_call: bool = True):
         out_dir = output_dir or self.args.output_dir
         os.makedirs(out_dir, exist_ok=True)
-        # 仅保存压缩器
-        path = save_compressor_weights(self.model, out_dir)
-        # 同步保存训练状态（优化器/调度器/随机种子等）
-        self.state.save_to_json(os.path.join(out_dir, "trainer_state.json"))
-        if self.args.should_save:
-            torch.save(self.args, os.path.join(out_dir, "training_args.bin"))
-        self.log({"compressor_ckpt": path})
+        path = None
+        if getattr(self.args, "deepspeed", None):
+            try:
+                import deepspeed
+            except Exception:
+                pass
+            model_to_save = self.model_wrapped.module if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module") else (self.model.module if hasattr(self.model, "module") else self.model)
+            if self.args.process_index == 0:
+                sd = {}
+                for name, p in model_to_save.named_parameters():
+                    if ".compressor." in name:
+                        try:
+                            with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
+                                if p is not None and p.data is not None and p.data.numel() > 0:
+                                    sd[name] = p.data.detach().cpu().clone()
+                        except Exception:
+                            pass
+                if sd:
+                    path = os.path.join(out_dir, "compressor.pt")
+                    torch.save(sd, path)
+                    try:
+                        from untils import collect_compressor_config
+                        cfg = collect_compressor_config(model_to_save)
+                        with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
+                            import json
+                            json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    except Exception:
+                        pass
+        else:
+            path = save_compressor_weights(self.model, out_dir)
+        if self.args.process_index == 0:
+            self.state.save_to_json(os.path.join(out_dir, "trainer_state.json"))
+            if self.args.should_save:
+                torch.save(self.args, os.path.join(out_dir, "training_args.bin"))
+            if path:
+                self.log({"compressor_ckpt": path})
 
 
 def main():
@@ -243,7 +273,9 @@ def main():
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
     config.mem_max_len = args.mem_max_len
-
+    config.conv_kernel = 4
+    config.state_size = 256
+    config.chunk_size = 512
     # --- model ---
     # 注意：backbone 从 base 权重加载，compressor 为新增参数 -> ignore_mismatched_sizes=True
     model = AutoModelForCausalLM.from_pretrained(
@@ -336,6 +368,7 @@ def main():
         fp16=args.fp16,
         optim="adamw_torch",
         report_to="wandb",  # 如需W&B等自行开启
+        deepspeed=args.deepspeed,
     )
 
     # --- callbacks: 随机滑窗 + 每轮重置记忆状态 ---
