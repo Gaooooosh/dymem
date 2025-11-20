@@ -322,20 +322,9 @@ class Mamba2Cache:
 
 class StaticSlidingWindowLayerWithSink(StaticLayer):
     def __init__(self, sink: int, sliding_window: int):
-        # 注意：这里传入 sink，内部实际容量是 sink + 1 (Mem) + sliding_window
-        # 为了匹配你之前的逻辑: sink_len 位置是 mem_act
-        # 这里的 sink 参数应当是 num_attn_sinks (例如 128)
-        super().__init__(sink + 1 + sliding_window)
-        
-        self.sink_len = sink  # 纯 sink 长度
-        self.mem_idx = sink   # mem token 的物理索引 (即第129个位置)
-        self.window_start_idx = sink + 1 # 滑动窗口起始物理索引
+        self.sink = sink
         self.sliding_windows = sliding_window
-        self.current_seq_len = 0
-        # 记录滑动窗口内的相对写入位置 (0 ~ sliding_windows-1)
-        self.window_write_pos = 0 
-        # 记录当前窗口内有效数据量
-        self.window_valid_len = 0
+        super().__init__(sink + sliding_window)
 
     def lazy_initialization(self, key_states: torch.Tensor):
         self.max_batch_size, self.num_heads, _, self.head_dim = key_states.shape
@@ -343,13 +332,18 @@ class StaticSlidingWindowLayerWithSink(StaticLayer):
 
         self.keys = torch.zeros(
             (self.max_batch_size, self.num_heads, self.max_cache_len, self.head_dim),
-            dtype=self.dtype, device=self.device
+            dtype=self.dtype,
+            device=self.device,
         )
         self.values = torch.zeros(
             (self.max_batch_size, self.num_heads, self.max_cache_len, self.head_dim),
-            dtype=self.dtype, device=self.device
+            dtype=self.dtype,
+            device=self.device,
         )
-        
+
+        # 用于跟踪“已经写了多少个 token”（逻辑长度），不依赖 cache_position
+        self.current_seq_len = 0
+
         if not is_torchdynamo_compiling():
             torch._dynamo.mark_static_address(self.keys)
             torch._dynamo.mark_static_address(self.values)
@@ -360,109 +354,51 @@ class StaticSlidingWindowLayerWithSink(StaticLayer):
         self,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        cache_kwargs: Optional[dict[str, Any]] = None,
+        cache_kwargs: Optional[dict[str, Any]] = None,  # 兼容旧接口，但不使用 cache_position
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        1. 更新内部静态 Ring Buffer。
-        2. 返回整理好的、逻辑连续的、不包含无效零值的 Tensor。
-        """
+        # Lazy initialization
         if not self.is_initialized:
             self.lazy_initialization(key_states)
 
+        # 本次要写入的序列长度（逻辑上是连续追加）
         seq_len = key_states.shape[-2]
-        
-        # ================= 1. 写入逻辑 (物理层：Ring Buffer) =================
-        
-        # 这里简化逻辑：假设 prefill 阶段是一次性写入，decode 阶段是逐个写入
-        # 但为了严谨，我们按照 token 逐个位置计算
-        
-        # 生成本次写入数据的逻辑位置索引 (相对于 sink 之后)
-        # 注意：我们只维护 sliding window 部分的自动轮转
-        # Sink 和 Mem 部分通常是固定或由外部直接覆盖的，但为了 update 兼容性，
-        # 如果 seq_len 很长（prefill），我们需要填满 sink
-        
-        # 既然你外部逻辑会手动覆盖 mem_idx，这里 update 主要负责填入 context
-        
-        start_logic_idx = self.current_seq_len # 全局逻辑计数
-        
-        # 构造物理索引映射
-        indices = []
-        for i in range(seq_len):
-            logic_pos = start_logic_idx + i
-            
-            if logic_pos < self.sink_len:
-                # 还在 Sink 区域
-                phys_pos = logic_pos
-            elif logic_pos == self.sink_len:
-                # 正好撞上 Mem 位置，跳过，放入 Window 的第一个位置？
-                # 或者 update 函数暂时把这个位置当作普通位置写，后面你再覆盖？
-                # 根据你的代码逻辑，Mem 位置是特殊的。
-                # 这里最稳妥的是：Mem 位置暂时不动（或被写），Window 从 sink+1 开始
-                phys_pos = self.mem_idx # 先写进去，回头你外部会覆盖
-            else:
-                # 进入滑动窗口区域 (logic_pos > sink_len)
-                # 相对窗口的位置
-                rel_pos = (logic_pos - (self.sink_len + 1)) % self.sliding_windows
-                phys_pos = self.window_start_idx + rel_pos
-                
-                # 更新窗口状态指针
-                self.window_write_pos = (rel_pos + 1) % self.sliding_windows
-                self.window_valid_len = min(self.window_valid_len + 1, self.sliding_windows)
-                
-            indices.append(phys_pos)
 
-        mapped_positions = torch.tensor(indices, device=self.device, dtype=torch.long)
-        
-        # 执行写入
+        # 这批 token 的逻辑位置 [start, start + seq_len)
+        start = self.current_seq_len
+        logical_positions = torch.arange(
+            start,
+            start + seq_len,
+            device=self.device,
+        )  # [seq_len]
+
+        # 映射到物理 cache 位置
+        mapped_positions = logical_positions.clone()
+
+        # sink 段: pos < self.sink -> 物理位置 pos
+        # sliding 段: pos >= self.sink -> 环形缓冲区
+        if self.sliding_windows > 0:
+            sliding_mask = mapped_positions >= self.sink
+            if sliding_mask.any():
+                sliding_pos = mapped_positions[sliding_mask]
+                mapped_positions[sliding_mask] = (
+                    self.sink + (sliding_pos - self.sink) % self.sliding_windows
+                )
+
+        # 更新 cache（注意用 mapped_positions，而不是 cache_position）
         try:
             self.keys.index_copy_(2, mapped_positions, key_states)
             self.values.index_copy_(2, mapped_positions, value_states)
         except NotImplementedError:
+            # Fallback for devices like MPS where index_copy_ 可能不支持
             self.keys[:, :, mapped_positions] = key_states
             self.values[:, :, mapped_positions] = value_states
 
+        # 逻辑长度增加
         self.current_seq_len += seq_len
 
-        # ================= 2. 读取逻辑 (逻辑层：Unroll & Slice) =================
-        # 我们需要构造一个视图，使得数据顺序为：[Sink] -> [Mem] -> [Sorted Window]
-        
-        # A. 提取 Sink 和 Mem 部分 (这部分是线性的，总是 valid)
-        # 有效 sink 长度
-        valid_sink_end = min(self.current_seq_len, self.window_start_idx)
-        k_sink_mem = self.keys[:, :, :valid_sink_end]
-        v_sink_mem = self.values[:, :, :valid_sink_end]
-        
-        # 如果还没填到 Window 区域，直接返回
-        if self.current_seq_len <= self.window_start_idx:
-            return k_sink_mem, v_sink_mem
-            
-        # B. 提取 Window 部分并排序 (Unroll)
-        # 物理窗口区域：self.keys[:, :, window_start_idx : window_start_idx + sliding_windows]
-        k_window_raw = self.keys[:, :, self.window_start_idx : self.window_start_idx + self.sliding_windows]
-        v_window_raw = self.values[:, :, self.window_start_idx : self.window_start_idx + self.sliding_windows]
-        
-        # 只有有效的部分
-        if self.window_valid_len < self.sliding_windows:
-            # 还没满，没有回绕，直接切片
-            k_window_out = k_window_raw[:, :, :self.window_valid_len]
-            v_window_out = v_window_raw[:, :, :self.window_valid_len]
-        else:
-            # 满了，发生回绕。
-            # 最老的数据在 self.window_write_pos
-            # 最新的数据在 self.window_write_pos - 1
-            # 我们需要将 [write_pos:] 拼在 [:write_pos] 前面，或者用 roll
-            
-            # 负数 shift 表示向左移，把 write_pos 移到 0
-            shift = -self.window_write_pos
-            k_window_out = torch.roll(k_window_raw, shifts=shift, dims=2)
-            v_window_out = torch.roll(v_window_raw, shifts=shift, dims=2)
-            
-        # C. 拼接最终结果
-        # 此时 k_window_out 是逻辑连续的，紧跟在 mem 之后
-        k_out = torch.cat([k_sink_mem, k_window_out], dim=2)
-        v_out = torch.cat([v_sink_mem, v_window_out], dim=2)
-        
-        return k_out, v_out
+        return self.keys, self.values
+
+
 class CacheWithMem(StaticCache):
     def __init__(self, config: PretrainedConfig, *args, **kwargs):
         
@@ -482,7 +418,7 @@ class CacheWithMem(StaticCache):
             num_hidden_layers = config.num_hidden_layers,
         )
         self.mem_position_embed = []
-        self.mem_cache = Mamba2Cache(mamba_config,batch_size=kwargs.get('max_batch_size', 1),*args, **kwargs)
+        self.mem_cache = Mamba2Cache(mamba_config,batch_size=1,*args, **kwargs)
         self.hidden_cache = StaticHiddenCache(config, *args, **kwargs)
 
         super().__init__(config,max_cache_len=config.sliding_window + 1 + config.num_attn_sinks, *args, **kwargs)
