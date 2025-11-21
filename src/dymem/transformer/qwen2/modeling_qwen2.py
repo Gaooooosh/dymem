@@ -665,11 +665,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         sequence_length: int,
         target_length: int,
         dtype: torch.dtype,
-        device: torch.device,
         cache_position: torch.Tensor,
         batch_size: int,
         config: Qwen2Config,
         past_key_values: Cache,
+        device: Optional[torch.device] = None,
     ):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -700,6 +700,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
             causal_mask = attention_mask
         else:
             min_dtype = torch.finfo(dtype).min
+            if device is None:
+                device = attention_mask.device if attention_mask is not None else cache_position.device
             causal_mask = torch.full(
                 (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
             )

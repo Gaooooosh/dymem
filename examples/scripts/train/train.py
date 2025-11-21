@@ -324,6 +324,10 @@ def main():
             args.max_steps = -1
 
     # --- dataset & collator ---
+    tokenizer.padding_side = 'right'
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     train_dataset = build_dataset(tokenizer, args)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 

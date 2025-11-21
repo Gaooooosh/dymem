@@ -168,6 +168,31 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         x_embed = (x * cos) + (rotate_half(x) * sin)
         return x_embed
 
+    def _local_update_causal_mask(self, query_states, key_states):
+        q_len = query_states.shape[2]
+        
+        # 1. Decoding: 只要 Q 是 1，就看全部，无需 Mask
+        if q_len == 1:
+            return None
+            
+        # 2. Prefilling: 构建标准因果 Mask
+        # 只有上三角区域 (j > i) 是 -inf，其余是 0
+        dtype = query_states.dtype
+        min_val = torch.finfo(dtype).min
+        
+        mask = torch.full(
+            (q_len, key_states.shape[2]), 
+            min_val, 
+            device=query_states.device, 
+            dtype=dtype
+        )
+        # triu(1) 是上三角。我们需要: 上三角=-inf, 下三角=0
+        # 方法：先全 0，再把上三角填成 -inf
+        mask = torch.zeros_like(mask)
+        mask.masked_fill_(torch.ones_like(mask, dtype=torch.bool).triu_(1), min_val)
+        
+        return mask[None, None, :, :]
+
     def forward(
         self,
         prenormed_hidden: torch.Tensor,                                 # [B,T,H]
@@ -277,22 +302,22 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
+                pass
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # 生成 Mask
+        causal_mask = self._local_update_causal_mask(query_states, key_states)
 
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
             value_states,
-            attention_mask,
+            causal_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # main diff with Llama
+            sliding_window=None,  # main diff with Llama
             **kwargs,
         )
 
@@ -392,6 +417,23 @@ class Qwen2Model(Qwen2Model_):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _update_causal_mask(
+        self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions
+    ):
+        # 1. 针对 Flash Attention 2，直接返回
+        if self.config._attn_implementation == "flash_attention_2":
+            return attention_mask
+
+        # 2. 针对 SDPA (非 Flash Attention)
+        # 我们不再这里生成 Causal Mask，因为 Layer 内部会改变 Q/K 的长度。
+        # 我们只传递 attention_mask (padding mask) 给 Layer。
+        # 如果 attention_mask 存在且包含 0 (padding)，保持原样传递；否则传 None。
+        
+        if attention_mask is not None and torch.any(attention_mask == 0):
+             return attention_mask
+        
+        return None
+
     @can_return_tuple
     def forward(
         self,
@@ -445,15 +487,14 @@ class Qwen2Model(Qwen2Model_):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
 
-        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         if self.training:
-            self.sliding_window = random.choice(self.config.windows_choices)
+            w = random.choice(self.config.windows_choices)
+            for layer in self.layers:
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.sliding_window = w
         else:
             self.sliding_window = self.config.sliding_window
             # print(f"sliding_window: {self.sliding_window}")
@@ -463,6 +504,7 @@ class Qwen2Model(Qwen2Model_):
 
             layer_outputs = decoder_layer(
                 hidden_states,
+                attention_mask=attention_mask,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
