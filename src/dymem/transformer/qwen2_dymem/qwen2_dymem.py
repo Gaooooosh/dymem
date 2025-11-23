@@ -25,8 +25,7 @@ from dymem.transformer.qwen2.modeling_qwen2 import (
     eager_attention_forward,
 )
 
-from dymem.utils import CacheWithMem,StaticHiddenCache,repeat_memkv
-# from dymem.rnn import Mamba2
+from dymem.utils import CacheWithMem
 from fla.layers.mamba2 import Mamba2
 from dataclasses import dataclass
 from transformers.cache_utils import Cache, DynamicCache
@@ -417,23 +416,6 @@ class Qwen2Model(Qwen2Model_):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def _update_causal_mask(
-        self, attention_mask, input_tensor, cache_position, past_key_values, output_attentions
-    ):
-        # 1. 针对 Flash Attention 2，直接返回
-        if self.config._attn_implementation == "flash_attention_2":
-            return attention_mask
-
-        # 2. 针对 SDPA (非 Flash Attention)
-        # 我们不再这里生成 Causal Mask，因为 Layer 内部会改变 Q/K 的长度。
-        # 我们只传递 attention_mask (padding mask) 给 Layer。
-        # 如果 attention_mask 存在且包含 0 (padding)，保持原样传递；否则传 None。
-        
-        if attention_mask is not None and torch.any(attention_mask == 0):
-             return attention_mask
-        
-        return None
-
     @can_return_tuple
     def forward(
         self,
@@ -504,7 +486,7 @@ class Qwen2Model(Qwen2Model_):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,

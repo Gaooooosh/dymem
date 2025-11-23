@@ -265,7 +265,6 @@ class Mamba2Cache:
 
     def lazy_initialization(self, state: torch.Tensor):
         self.dtype, self.device = state.dtype, state.device
-
         # 用 empty 避免初始化填零的显著开销；我们只会读取到已经被写入的区域
         self.conv_states = torch.empty(
             self.num_hidden_layers,
