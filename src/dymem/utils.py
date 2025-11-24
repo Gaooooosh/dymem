@@ -4,9 +4,10 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Any, override, Union
-from transformers import DynamicCache, StaticSlidingWindowLayer
+from transformers import StaticSlidingWindowLayer
 from fla.models.mamba2.configuration_mamba2 import Mamba2Config
-from transformers.cache_utils import Cache,DynamicCache,StaticCache,StaticLayer
+# from fla.models.mamba2.modeling_mamba2 import Mamba2Cache
+from transformers.cache_utils import StaticCache,StaticLayer
 from transformers.configuration_utils import PretrainedConfig
 def register_custom_accelerator():
     from accelerate import Accelerator
@@ -91,9 +92,9 @@ class GroupLinear(nn.Module):
         )  # (B, L, out_features)
         return out
 
-def is_torchdynamo_compiling() -> Union[tuple[bool, str], bool]:
-    if not torch.cuda.is_available():
-        return False
+# def is_torchdynamo_compiling() -> Union[tuple[bool, str], bool]:
+#     if not torch.cuda.is_available():
+#         return False
 
 class StaticSlidingWindowLayerHiddenOnly(StaticSlidingWindowLayer):
     is_sliding = True
@@ -117,8 +118,8 @@ class StaticSlidingWindowLayerHiddenOnly(StaticSlidingWindowLayer):
         )
         self.values = None
 
-        if not is_torchdynamo_compiling():
-            torch._dynamo.mark_static_address(self.keys)
+        # if not is_torchdynamo_compiling():
+        #     torch._dynamo.mark_static_address(self.keys)
 
         self.is_initialized = True
 
@@ -248,92 +249,71 @@ class StaticHiddenCache(StaticCache):
         return keys
 
 class Mamba2Cache:
+
     def __init__(
         self,
         config: Mamba2Config,
         batch_size: int,
+        dtype: torch.dtype = torch.float16,
+        device: Optional[str] = None,
     ):
+        self.dtype = dtype
         self.conv_kernel_size = config.conv_kernel
         self.n_groups = config.n_groups
         self.state_size = config.state_size
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
         self.intermediate_size = int(config.expand * config.hidden_size)
-        self.num_hidden_layers = config.num_hidden_layers
-        self.batch_size = batch_size
-        self.is_initialized = False
 
-    def lazy_initialization(self, state: torch.Tensor):
-        self.dtype, self.device = state.dtype, state.device
-        # 用 empty 避免初始化填零的显著开销；我们只会读取到已经被写入的区域
-        self.conv_states = torch.empty(
-            self.num_hidden_layers,
-            self.batch_size,
+        self.conv_states = torch.zeros(
+            config.num_hidden_layers,
+            batch_size,
             self.intermediate_size + 2 * self.n_groups * self.state_size,
             self.conv_kernel_size,
-            device=self.device,
-            dtype=self.dtype,
+            device=device,
+            dtype=dtype,
         )
-        self.ssm_states = torch.empty(
-            self.num_hidden_layers,
-            self.batch_size,
+        self.ssm_states = torch.zeros(
+            config.num_hidden_layers,
+            batch_size,
             self.num_heads,
             self.head_dim,
             self.state_size,
-            device=self.device,
-            dtype=self.dtype,
+            device=device,
+            dtype=dtype,
         )
-
-        if not is_torchdynamo_compiling():
-            torch._dynamo.mark_static_address(self.conv_states)
-            torch._dynamo.mark_static_address(self.ssm_states)
-
-        self.is_initialized = True
-
+    @torch._dynamo.disable
     def update_conv_state(
         self,
         layer_idx: int,
         new_conv_state: torch.Tensor,
         cache_init: bool = False
     ) -> torch.Tensor:
-        if not self.is_initialized:
-            self.lazy_initialization(new_conv_state)
-        
         if cache_init:
             self.conv_states[layer_idx] = new_conv_state.to(self.conv_states.device)
         else:
             self.conv_states[layer_idx] = self.conv_states[layer_idx].roll(shifts=-1, dims=-1)
             self.conv_states[layer_idx][:, :, -1] = new_conv_state[:, 0, :].to(self.conv_states.device)
         return self.conv_states[layer_idx]
-
+    @torch._dynamo.disable
     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
-        if not self.is_initialized:
-            self.lazy_initialization(new_ssm_state)
-
         self.ssm_states[layer_idx] = new_ssm_state.to(self.ssm_states.device)
         return self.ssm_states[layer_idx]
-
+    @torch._dynamo.disable
     def reset(self):
-        if not self.is_initialized:
-            self.lazy_initialization(state)
         self.conv_states.zero_()
         self.ssm_states.zero_()
 
 class StaticSlidingWindowLayerWithSink(StaticLayer):
     def __init__(self, sink: int, sliding_window: int):
-        # 注意：这里传入 sink，内部实际容量是 sink + 1 (Mem) + sliding_window
-        # 为了匹配你之前的逻辑: sink_len 位置是 mem_act
-        # 这里的 sink 参数应当是 num_attn_sinks (例如 128)
         super().__init__(sink + 1 + sliding_window)
         
-        self.sink_len = sink  # 纯 sink 长度
-        self.mem_idx = sink   # mem token 的物理索引 (即第129个位置)
-        self.window_start_idx = sink + 1 # 滑动窗口起始物理索引
+        self.sink_len = sink
+        self.mem_idx = sink
+        self.window_start_idx = sink + 1
         self.sliding_windows = sliding_window
         self.current_seq_len = 0
-        # 记录滑动窗口内的相对写入位置 (0 ~ sliding_windows-1)
         self.window_write_pos = 0 
-        # 记录当前窗口内有效数据量
         self.window_valid_len = 0
 
     def lazy_initialization(self, key_states: torch.Tensor):
@@ -349,9 +329,9 @@ class StaticSlidingWindowLayerWithSink(StaticLayer):
             dtype=self.dtype, device=self.device
         )
         
-        if not is_torchdynamo_compiling():
-            torch._dynamo.mark_static_address(self.keys)
-            torch._dynamo.mark_static_address(self.values)
+        # if not is_torchdynamo_compiling():
+        #     torch._dynamo.mark_static_address(self.keys)
+        #     torch._dynamo.mark_static_address(self.values)
 
         self.is_initialized = True
 
@@ -463,7 +443,7 @@ class StaticSlidingWindowLayerWithSink(StaticLayer):
         
         return k_out, v_out
 class CacheWithMem(StaticCache):
-    def __init__(self, config: PretrainedConfig, *args, **kwargs):
+    def __init__(self, config: PretrainedConfig, dtype: Optional[torch.dtype] = None, device: Optional[torch.device] = None, *args, **kwargs):
         
         num_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
@@ -480,13 +460,17 @@ class CacheWithMem(StaticCache):
             chunk_size=config.chunk_size,
             num_hidden_layers = config.num_hidden_layers,
         )
-        self.mem_position_embed = []
-        self.mem_cache = Mamba2Cache(mamba_config,batch_size=kwargs.get('max_batch_size', 1),*args, **kwargs)
-        self.hidden_cache = StaticHiddenCache(config, *args, **kwargs)
+        if dtype is None:
+            dtype = getattr(config, "dtype", torch.float16)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        super().__init__(config,max_cache_len=config.sliding_window + 1 + config.num_attn_sinks, *args, **kwargs)
+        self.mem_position_embed = []
+        self.mem_cache = Mamba2Cache(mamba_config, batch_size=kwargs.get('max_batch_size', 1), dtype=dtype, device=device, *args, **kwargs)
+        self.hidden_cache = StaticHiddenCache(config, *args, **kwargs)
+        super().__init__(config, max_cache_len=config.sliding_window + 1 + config.num_attn_sinks, *args, **kwargs)
         config = config.get_text_config(decoder=True)
         self.layers = []
         for layer_idx in range(config.num_hidden_layers):
-            layer = StaticSlidingWindowLayerWithSink(config.num_attn_sinks + 1, config.sliding_window)
+            layer = StaticSlidingWindowLayerWithSink(config.num_attn_sinks, config.sliding_window)
             self.layers.append(layer)

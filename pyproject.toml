@@ -23,6 +23,7 @@ dependencies = [
     "torchvision>=0.24.0",
     "transformers>=4.57.1",
     "wandb>=0.22.2",
+    "gradio>=4.0.0",
 ]
 
 [tool.setuptools]

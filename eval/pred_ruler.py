@@ -22,7 +22,12 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 import time
 import shutil
+
+from dymem.transformer.qwen2_dymem import register_customized_qwen2
+register_customized_qwen2()
+
 from dymem.utils import CacheWithMem
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -111,70 +116,26 @@ def get_pred(
 
     count = 0
     for json_obj in tqdm(data):
-
         count += 1
-
         if exclude_or:
             if "or" in json_obj["input"]:
                 continue
 
         prompt = prompt_format.format(**json_obj)
-
-        if retrieval is None:
-            # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
-            tokenized_prompt = tokenizer(
-                prompt, truncation=False, return_tensors="pt"
-            ).input_ids[0]
-        else:
-            prompt_context = prompt.split(
-                prompt_format.split("{context}")[-1].split("Question")[0]
-            )[0]
-            tokenized_prompt = tokenizer(
-                prompt_context, truncation=False, return_tensors="pt"
-            ).input_ids[0]
-
-        if max_length > 0 and len(tokenized_prompt) > max_length:
-            if retrieval is None:
-                # truncate at the beginning:
-                prompt = tokenizer.decode(
-                    tokenized_prompt[-(max_length - max_gen) :],
-                    skip_special_tokens=True,
-                )
-
-            else:
-                tokenized_prompt = tokenizer(
-                    tokenizer.decode(
-                        tokenized_prompt[-(max_length - max_gen) :],
-                        skip_special_tokens=True,
-                    ),
-                    truncation=False,
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                ).input_ids[0]
-
-        if dataset not in [
-            "trec",
-            "triviaqa",
-            "samsum",
-            "lsht",
-            "lcc",
-            "repobench-p",
-        ]:  # chat models are better off without build prompts on these tasks
-            prompt = build_chat(tokenizer, prompt, model_name)
-
         input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
 
         context_length = input.input_ids.shape[-1]
         cache = CacheWithMem(model.config)
-        output = model.generate(
-            **input,
-            max_new_tokens=max_gen,
-            num_beams=1,
-            do_sample=False,
-            temperature=1.0,
-            past_key_values=cache,
-            use_cache=True,
-        )[0]
+        with torch.no_grad():
+            output = model.generate(
+                **input,
+                max_new_tokens=max_gen,
+                num_beams=1,
+                do_sample=False,
+                temperature=1.0,
+                past_key_values=cache,
+                use_cache=True,
+            )[0]
 
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
         pred = post_process(pred, model_name)
@@ -217,11 +178,8 @@ def load_model_and_tokenizer(path, device):
 if __name__ == "__main__":
     args = parse_args()
     seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
     model_name = args.model_name
-
-    from dymem.transformer.qwen2_dymem import register_customized_qwen2
-    register_customized_qwen2()
     model, tokenizer = load_model_and_tokenizer(args.model_path, device)
 
     model.config.sliding_window = args.sliding_window

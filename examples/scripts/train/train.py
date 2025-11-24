@@ -64,6 +64,7 @@ from transformers import (
 )
 
 # 若 qwen2_dymem.py 与本脚本在同一目录，确保可导入
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
@@ -77,6 +78,7 @@ from untils import (
     freeze_backbone_except_compressor,
     set_sliding_window,
     save_compressor_weights,
+    load_compressor_weights,
     RandomSlidingWindowCallback,
     ResetMemCallback,
     reinit_compressor,
@@ -140,6 +142,8 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=-1,help="当使用 --streaming 时必须指定，或设置 --max_train_samples 让脚本自动估算。")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deepspeed", type=str, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--auto_resume", action="store_true")
 
     # 调试选项
     parser.add_argument("--debug_one_step", action="store_true", help="开启单步前向+反向调试，捕捉 compressor 引入的 NaN/Inf。")
@@ -403,7 +407,43 @@ def main():
         callbacks=callbacks,
     )
 
-    trainer.train() 
+    def _find_latest_checkpoint(output_dir: str):
+        if not os.path.isdir(output_dir):
+            return None
+        subs = []
+        for d in os.listdir(output_dir):
+            p = os.path.join(output_dir, d)
+            if os.path.isdir(p) and d.startswith("checkpoint-"):
+                try:
+                    step = int(d.split("-")[-1])
+                except Exception:
+                    step = -1
+                if step >= 0:
+                    subs.append((step, p))
+        if not subs:
+            return None
+        subs.sort(key=lambda x: x[0])
+        return subs[-1][1]
+
+    resume_path = None
+    if args.resume_from_checkpoint:
+        resume_path = args.resume_from_checkpoint
+    elif args.auto_resume:
+        resume_path = _find_latest_checkpoint(args.output_dir)
+
+    if resume_path:
+        cpath = resume_path if os.path.isfile(resume_path) else os.path.join(resume_path, "compressor.pt")
+        if os.path.exists(cpath):
+            try:
+                load_compressor_weights(model, cpath, strict=False)
+            except Exception:
+                pass
+        if os.path.isdir(resume_path):
+            trainer.train(resume_from_checkpoint=resume_path)
+        else:
+            trainer.train()
+    else:
+        trainer.train() 
     # 结束时再保存一次（依然只保存 compressor）
     trainer.save_model(args.output_dir)
 

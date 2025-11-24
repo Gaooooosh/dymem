@@ -27,6 +27,7 @@ from dymem.transformer.qwen2.modeling_qwen2 import (
 
 from dymem.utils import CacheWithMem
 from fla.layers.mamba2 import Mamba2
+from dymem.rnn.mamba2 import Mamba2
 from dataclasses import dataclass
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import _flash_attention_forward, FlashAttentionKwargs
@@ -121,7 +122,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         super().__init__(config=config, layer_idx=layer_idx)
         self.config = config
         self.layer_idx = layer_idx
-
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -129,21 +129,16 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.num_attn_sinks = getattr(config, 'num_attn_sinks', 128)
         self.sliding_window = getattr(config, 'sliding_window', 256)
         self.mem_max_len = getattr(config, 'mem_max_len', 2048)
-
-        ahn_impl = getattr(config, '_ahn_implementation', None)
-        if ahn_impl is not None:
-            self.compressor = Mamba2(
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                hidden_size=config.hidden_size,
-                state_size = config.state_size,
-                expand = 1,
-                layer_idx=layer_idx,
-                n_groups=self.num_kv_groups,
-                chunk_size=config.chunk_size,
-                )
-        else:
-            self.compressor = None
+        self.compressor = Mamba2(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            hidden_size=config.hidden_size,
+            state_size = config.state_size,
+            expand = 1,
+            layer_idx=layer_idx,
+            n_groups=self.num_kv_groups,
+            chunk_size=config.chunk_size,
+        )
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -215,12 +210,12 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             if self.compressor is not None and overflow > 0:
                 # 正确的被压缩段：去掉前端 sink 与末端滑窗，中间段作为被驱逐 token
                 evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
-                with torch.amp.autocast(device_type="cuda",enabled=False):
-                    mem_out = self.compressor(
-                        evicted_hidden_states.float() if self.training else evicted_hidden_states,
-                        cache_params=past_key_value.mem_cache if past_key_value is not None else None,
-                        cache_position=None,
-                    )  # [B, EVC_T, H]
+                # with torch.amp.autocast(device_type="cuda",enabled=False):
+                mem_out = self.compressor(
+                    evicted_hidden_states.float() if self.training else evicted_hidden_states,
+                    cache_params=past_key_value.mem_cache if past_key_value is not None else None,
+                    cache_position=cache_position,
+                )  # [B, EVC_T, H]
                 mem_act = mem_out[:, -1:, :] # [B, 1, H]
 
                 if past_key_value is not None:
@@ -229,19 +224,19 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
                 prenormed_hidden = torch.cat(
                     [
-                        prenormed_hidden[:, :sink_len + 1, :],
+                        prenormed_hidden[:, :sink_len + 1, :], # +1 给mem预留长度
                         # mem_act.to(prenormed_hidden.device),
                         prenormed_hidden[:, evict_end_index:, :],  # 保留末端滑窗
                     ],
                     dim=1,
                 )
                 position_embeddings = (
-                    torch.cat([position_embeddings[0][:, :sink_len + 1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
-                    torch.cat([position_embeddings[1][:, :sink_len + 1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
+                    torch.cat([position_embeddings[0][:, :sink_len+1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
+                    torch.cat([position_embeddings[1][:, :sink_len+1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
                 )
 
             elif past_key_value is not None and T > sink_len:
-                    past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len:, :], self.layer_idx)
+                    past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len+1:, :], self.layer_idx)
 
         else:
             # decode
@@ -253,7 +248,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                 if self.compressor is not None:
                     ev_views = layer_cache.eviction_slices(prenormed_hidden.shape[1])  # T==1 -> 1
                     if ev_views:
-                        with torch.amp.autocast(device_type="cuda", enabled=False):
+                        # with torch.amp.autocast(device_type="cuda", enabled=False):
                             mem_out_step = None
                             for evt in ev_views:
                                 # e: [B, evict_len, H]，为原缓存上的视图；不做 .copy_()
@@ -307,7 +302,8 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
         # 生成 Mask
         causal_mask = self._local_update_causal_mask(query_states, key_states)
-
+        if causal_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -324,7 +320,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         attn_output = attn_output.reshape(B, T, -1)
         if mem_out is not None:
             if T > 1:
-                attn_output = torch.cat([attn_output[:,:sink_len,:], mem_out, attn_output[:,sink_len+1:,:]], dim=1)
+                attn_output = torch.cat([attn_output[:,:sink_len,:], mem_out[:,:-1,:], attn_output[:,sink_len:,:]], dim=1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -446,8 +442,8 @@ class Qwen2Model(Qwen2Model_):
             )
             use_cache = False
 
-        if not isinstance(past_key_values, (type(None), Cache)):
-            raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
+        if not isinstance(past_key_values, (type(None), CacheWithMem)):
+            raise ValueError("The `past_key_values` should be either a `MemCache` object or `None`.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -558,37 +554,6 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
-        r"""
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
-
-        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
