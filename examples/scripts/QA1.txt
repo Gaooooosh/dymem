@@ -584,4 +584,4 @@ While studying law and philosophy in England and Germany, Iqbal became a member 
 
 Answer the question based on the given documents. Only give me the answer and do not output any other words.
 
-Question: Who led Richard's troops when Cyprus was conquered?
+Question: Who led Richard's troops when Cyprus was conquered?(使用中文作答)

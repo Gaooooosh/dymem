@@ -1,0 +1,42 @@
+[2025-11-25 05:36:04] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:36:13] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:36:24] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:36:35] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:36:42] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:37:00] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:37:15] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:37:26] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:37:51] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:38:07] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:39:03] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:39:16] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:39:37] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:40:28] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:40:40] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:40:56] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:41:11] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:41:20] parse_or_write_error: AttributeError("'dict' object has no attribute 'choices'")
+[2025-11-25 05:56:18] api_error: RuntimeError('http_post_failed_after_retries')
+[2025-11-25 06:06:34] api_error: RuntimeError('http_post_failed_after_retries')
+[2025-11-25 08:48:37] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-25 09:08:34] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-25 11:07:31] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-26 06:07:54] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 02:32:44] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 02:53:18] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:03:49] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:06:58] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:12:13] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:17:45] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:18:32] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-27 03:19:35] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:21:12] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:32:12] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-27 03:35:10] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:38:28] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:45:59] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:49:44] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 03:56:49] api_error: <HTTPError 400: 'Bad Request'>
+[2025-11-27 04:07:11] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 04:13:48] api_error: <HTTPError 403: 'Forbidden'>
+[2025-11-27 04:19:18] api_error: <HTTPError 400: 'Bad Request'>

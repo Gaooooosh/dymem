@@ -247,17 +247,27 @@ class RandomSlidingWindowCallback(TrainerCallback):
         if not seq_len:
             seq_len = getattr(getattr(model, "config", object()), "max_position_embeddings", 2048)
 
-        # 采样并收紧到 [1, seq_len-1]
-        win = random.choice(self.choices)
-        if win >= seq_len:
-            win = max(1, seq_len - 1)
+        cfg = getattr(model, "config", None)
+        base_sink = getattr(cfg, "num_attn_sinks", 128) if cfg is not None else 128
+        sink_len = int(min(base_sink, seq_len))
+        valid = [int(w) for w in self.choices if int(w) < seq_len and (seq_len - int(w)) > sink_len]
+        if valid:
+            win = random.choice(valid)
+        else:
+            win = max(1, int(seq_len - sink_len - 1))
 
         set_sliding_window(model, win)
-        # 不在这里清空记忆；仍由 ResetMemCallback 控制（每个 epoch 开头清一次）
-        # 但如需每 step 清，可在 on_train_batch_end 做 reset_dymem_state(model)
+
+        target_sink = max(1, min(sink_len, seq_len - win - 1))
+        for attn in _iter_attn_modules(model):
+            try:
+                if hasattr(attn, "num_attn_sinks"):
+                    attn.num_attn_sinks = int(target_sink)
+            except Exception:
+                pass
 
         if state.global_step % max(1, args.logging_steps) == 0:
-            print(f"[rand-win] step={state.global_step} batch_seq_len={seq_len} window={win}")
+            print(f"[rand-win] step={state.global_step} batch_seq_len={seq_len} window={win} sink={target_sink}")
 
         return control
 

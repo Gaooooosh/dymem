@@ -470,6 +470,7 @@ class Qwen2Model(Qwen2Model_):
         all_self_attns = () if output_attentions else None
         if self.training:
             w = random.choice(self.config.windows_choices)
+            # print(f"sliding_window: {w}")
             for layer in self.layers:
                 if hasattr(layer, "self_attn"):
                     layer.self_attn.sliding_window = w
