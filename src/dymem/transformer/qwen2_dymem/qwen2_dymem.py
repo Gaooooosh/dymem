@@ -488,6 +488,7 @@ class Qwen2Model(Qwen2Model_):
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
                 cache_position=cache_position,
+                output_attentions=output_attentions,
             )
             hidden_states = layer_outputs[0]
 
