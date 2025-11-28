@@ -2,7 +2,7 @@ import os
 import sys
 import json
 import argparse
-from typing import List, Dict
+from typing import List, Dict, Union
 import torch
 from datasets import Dataset
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, set_seed
@@ -31,10 +31,25 @@ from untils import (
 
 
 """
+示例（现在支持多个 jsonl 路径）：
+
 CUDA_VISIBLE_DEVICES=0 python examples/scripts/sft/qwen2_dymem_sft.py \
---base_model /home/xiaoyonggao/dymem/qwen2.5-3b-compressor-Instruct\
---data_jsonl /home/xiaoyonggao/dymem/memory_sft_dataset.jsonl --output_dir /home/xiaoyonggao/dymem/outputs_sft_compressor --max_seq_len 8000 --per_device_train_batch_size 1 --gradient_accumulation_steps 2 --num_train_epochs 1 --learning_rate 5e-5 --bf16 --init_sliding_window 256 --num_attn_sinks 128 --mem_max_len 1024
+--base_model /home/xiaoyonggao/dymem/qwen2.5-3b-compressor-Instruct \
+--data_jsonl \
+    /home/xiaoyonggao/dymem/memory_sft_dataset_1.jsonl \
+    /home/xiaoyonggao/dymem/memory_sft_dataset_2.jsonl \
+--output_dir /home/xiaoyonggao/dymem/outputs_sft_compressor \
+--max_seq_len 8000 \
+--per_device_train_batch_size 1 \
+--gradient_accumulation_steps 2 \
+--num_train_epochs 1 \
+--learning_rate 5e-5 \
+--bf16 \
+--init_sliding_window 256 \
+--num_attn_sinks 128 \
+--mem_max_len 1024
 """
+
 
 class CompressorOnlyTrainer(Trainer):
     def save_model(self, output_dir: str = None, _internal_call: bool = True):
@@ -46,7 +61,11 @@ class CompressorOnlyTrainer(Trainer):
                 import deepspeed
             except Exception:
                 deepspeed = None
-            model_to_save = self.model_wrapped.module if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module") else (self.model.module if hasattr(self.model, "module") else self.model)
+            model_to_save = (
+                self.model_wrapped.module
+                if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module")
+                else (self.model.module if hasattr(self.model, "module") else self.model)
+            )
             if self.args.process_index == 0:
                 sd = {}
                 for name, p in model_to_save.named_parameters():
@@ -82,9 +101,26 @@ class CompressorOnlyTrainer(Trainer):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--base_model", type=str, default="/home/xiaoyonggao/dymem/qwen2.5-3b-compressor-Instruct")
-    p.add_argument("--data_jsonl", type=str, default="/home/xiaoyonggao/dymem/data/mem_sft/memory_sft_dataset.jsonl")
-    p.add_argument("--output_dir", type=str, default="/home/xiaoyonggao/dymem/outputs_sft_compressor")
+    p.add_argument(
+        "--base_model",
+        type=str,
+        default="/home/xiaoyonggao/dymem/qwen2.5-3b-compressor-Instruct",
+    )
+    # === 修改点：支持多个 jsonl 文件 ===
+    p.add_argument(
+        "--data_jsonl",
+        type=str,
+        nargs="+",  # 支持 1 个或多个路径
+        default=[
+            "/home/xiaoyonggao/dymem/data/mem_sft/memory_sft_dataset.jsonl",
+        ],
+        help="One or more jsonl files for SFT",
+    )
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        default="/home/xiaoyonggao/dymem/outputs_sft_compressor",
+    )
     p.add_argument("--max_seq_len", type=int, default=20000)
     p.add_argument("--min_train_tokens", type=int, default=4096)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
@@ -109,55 +145,86 @@ def parse_args():
     return p.parse_args()
 
 
-def build_sft_dataset(tokenizer: AutoTokenizer, jsonl_path: str, max_seq_len: int, min_train_tokens: int) -> Dataset:
+# === 修改点：build_sft_dataset 支持 List[str] 或 str，并一次性把多个文件样本合并 ===
+def build_sft_dataset(
+    tokenizer: AutoTokenizer,
+    jsonl_paths: Union[str, List[str]],
+    max_seq_len: int,
+    min_train_tokens: int,
+) -> Dataset:
+    if isinstance(jsonl_paths, str):
+        paths = [jsonl_paths]
+    else:
+        paths = list(jsonl_paths)
+
     samples: List[Dict[str, List[int]]] = []
 
     def tok(text: str) -> List[int]:
         out = tokenizer(text, add_special_tokens=False, truncation=False)
         return out["input_ids"]
 
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            instr = obj.get("instruction", "").strip()
-            inp = obj.get("input", "").strip()
-            out = obj.get("output", obj.get("response", "")).strip()
+    for jsonl_path in paths:
+        print(f"Loading SFT data from: {jsonl_path}")
+        if not os.path.isfile(jsonl_path):
+            print(f"[WARN] jsonl file not found: {jsonl_path}")
+            continue
 
-            prompt = "Instruction: " + instr
-            if inp:
-                prompt += "\nInput: " + inp
-            prompt += "\nResponse: "
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                instr = obj.get("instruction", "").strip()
+                inp = obj.get("input", "").strip()
+                out = obj.get("output", obj.get("response", "")).strip()
 
-            p_ids = tok(prompt)
-            o_ids = tok(out) + [tokenizer.eos_token_id] if out else []
+                prompt = "Instruction: " + instr
+                if inp:
+                    prompt += "\nInput: " + inp
+                prompt += "\nResponse: "
 
-            if not out:
-                text_ids = tok((instr + "\n" + inp).strip())
-                text_ids = text_ids[: max_seq_len - 1] + [tokenizer.eos_token_id]
-                if min_train_tokens <= 0 or len(text_ids) >= min_train_tokens:
-                    samples.append({"input_ids": text_ids, "labels": text_ids[:]})
-                continue
+                p_ids = tok(prompt)
+                o_ids = tok(out) + [tokenizer.eos_token_id] if out else []
 
-            total = len(p_ids) + len(o_ids)
-            if total > max_seq_len:
-                budget_resp = min(len(o_ids), max_seq_len // 2)
-                budget_prompt = max_seq_len - budget_resp
-                p_ids = p_ids[: max(1, budget_prompt - 1)]
-                o_ids = o_ids[: budget_resp]
+                # 无 output 的情况，当成纯 text 语言模型训练
+                if not out:
+                    text_ids = tok((inp + "\n" + instr).strip())
+                    text_ids = text_ids[: max_seq_len - 1] + [tokenizer.eos_token_id]
+                    if min_train_tokens <= 0 or len(text_ids) >= min_train_tokens:
+                        samples.append(
+                            {
+                                "input_ids": text_ids,
+                                "labels": text_ids[:],
+                            }
+                        )
+                    continue
+
                 total = len(p_ids) + len(o_ids)
                 if total > max_seq_len:
-                    o_ids = o_ids[: max_seq_len - len(p_ids)]
+                    budget_resp = min(len(o_ids), max_seq_len // 2)
+                    budget_prompt = max_seq_len - budget_resp
+                    p_ids = p_ids[: max(1, budget_prompt - 1)]
+                    o_ids = o_ids[: budget_resp]
+                    total = len(p_ids) + len(o_ids)
+                    if total > max_seq_len:
+                        o_ids = o_ids[: max_seq_len - len(p_ids)]
 
-            input_ids = p_ids + o_ids
-            labels = [-100] * len(p_ids) + o_ids[:]
-            if min_train_tokens <= 0 or len(input_ids) >= min_train_tokens:
-                samples.append({"input_ids": input_ids, "labels": labels})
+                input_ids = p_ids + o_ids
+                labels = [-100] * len(p_ids) + o_ids[:]
+                if min_train_tokens <= 0 or len(input_ids) >= min_train_tokens:
+                    samples.append(
+                        {
+                            "input_ids": input_ids,
+                            "labels": labels,
+                        }
+                    )
+
+    if not samples:
+        raise ValueError(f"No training samples built from paths: {paths}")
 
     return Dataset.from_list(samples)
 
@@ -246,7 +313,11 @@ def main():
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
     config.mem_max_len = args.mem_max_len
-    target_dtype = (torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None))
+    target_dtype = (
+        torch.bfloat16
+        if args.bf16
+        else (torch.float16 if args.fp16 else None)
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         config=config,
@@ -259,14 +330,24 @@ def main():
     model.train()
     freeze_backbone_except_compressor(model)
     set_sliding_window(model, args.init_sliding_window)
-    train_dataset = build_sft_dataset(tokenizer, args.data_jsonl, args.max_seq_len, args.min_train_tokens)
+
+    # 这里直接传 List[str] 进去，函数内部会处理
+    train_dataset = build_sft_dataset(
+        tokenizer,
+        args.data_jsonl,
+        args.max_seq_len,
+        args.min_train_tokens,
+    )
+
     data_collator = SFTDataCollator(tokenizer)
     win_choices = [int(x) for x in args.sliding_window_choices.split(",") if x.strip()]
     win_choices = [w for w in win_choices if w < args.max_seq_len]
     if not win_choices:
-        win_choices = [128, 256, 512, 1024,2048,4096]
+        win_choices = [128, 256, 512, 1024, 2048, 4096]
+    # 你原来后面又重置了一次，这里保持你的设置：
     win_choices = [128, 256, 512, 1024]
     model.config.windows_choices = win_choices
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
@@ -301,7 +382,11 @@ def main():
     elif args.auto_resume:
         resume_path = _find_latest_checkpoint(args.output_dir)
     if resume_path:
-        cpath = resume_path if os.path.isfile(resume_path) else os.path.join(resume_path, "compressor.pt")
+        cpath = (
+            resume_path
+            if os.path.isfile(resume_path)
+            else os.path.join(resume_path, "compressor.pt")
+        )
         if os.path.exists(cpath):
             try:
                 load_compressor_weights(model, cpath, strict=False)
