@@ -6,6 +6,8 @@ train.py
 - 每 step 随机采样滑动注意力窗口大小，防过拟合
 - 只保存 compressor 权重（自定义 Trainer.save_model）
 
+CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 train.py             --base_model Qwen/Qwen2.5-3B-Instruct             --data_jsonl /home/xiaoyonggao/dymem/data/mem_pretrain/train.jsonl --dataset_split train             --max_seq_len 7000             --per_device_train_batch_size 1             --gradient_accumulation_steps 4             --learning_rate 5e-4             --num_train_epochs 1             --init_sliding_window 128             --sliding_window_choices 128,256,512,1024,2048,4096             --num_attn_sinks 128             --mem_max_len 256             --output_dir outputs_dymem_2             --tf32             --bf16              --max_grad_norm 1.0 --save_steps 1000  --deepspeed ../../deepspeed/ds_z3_config.json 
+
 CUDA_VISIBLE_DEVICES=6 python train.py \
        --base_model Qwen/Qwen2.5-3B \
         --dataset_name vllg/loong_c4 \
@@ -117,7 +119,7 @@ def parse_args():
     parser.add_argument("--num_train_epochs", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
     # 梯度裁剪
     parser.add_argument("--max_grad_norm", type=float, default=0.5,
@@ -252,37 +254,27 @@ class CompressorOnlyTrainer(Trainer):
             except Exception:
                 pass
             model_to_save = self.model_wrapped.module if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module") else (self.model.module if hasattr(self.model, "module") else self.model)
-            sd = {} if self.args.process_index == 0 else None
-            for name, p in model_to_save.named_parameters():
-                if ".compressor." in name:
-                    try:
-                        with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
-                            if self.args.process_index == 0:
+            if self.args.process_index == 0:
+                sd = {}
+                for name, p in model_to_save.named_parameters():
+                    if ".compressor." in name:
+                        try:
+                            with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
                                 if p is not None and p.data is not None and p.data.numel() > 0:
                                     sd[name] = p.data.detach().cpu().clone()
+                        except Exception:
+                            pass
+                if sd:
+                    path = os.path.join(out_dir, "compressor.pt")
+                    torch.save(sd, path)
+                    try:
+                        from untils import collect_compressor_config
+                        cfg = collect_compressor_config(model_to_save)
+                        with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
+                            import json
+                            json.dump(cfg, f, ensure_ascii=False, indent=2)
                     except Exception:
                         pass
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                try:
-                    torch.distributed.barrier()
-                except Exception:
-                    pass
-            if self.args.process_index == 0 and sd:
-                path = os.path.join(out_dir, "compressor.pt")
-                torch.save(sd, path)
-                try:
-                    from untils import collect_compressor_config
-                    cfg = collect_compressor_config(model_to_save)
-                    with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
-                        import json
-                        json.dump(cfg, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    pass
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                try:
-                    torch.distributed.barrier()
-                except Exception:
-                    pass
         else:
             path = save_compressor_weights(self.model, out_dir)
         if self.args.process_index == 0:
@@ -337,11 +329,11 @@ def main():
     model.train()
     freeze_backbone_except_compressor(model)
     reinit_compressor(model)
+    model.gradient_checkpointing_enable()
     # 不强制将 compressor 模块转换为 FP32，遵循全局 dtype（例如 bf16）
     for n, m in model.named_modules():
         if "compressor" in n:
             m.to(torch.float32)
-    model.gradient_checkpointing_enable()
     # 初始化一次滑动窗口（训练中还会被回调随机覆盖）
     set_sliding_window(model, args.init_sliding_window)
 

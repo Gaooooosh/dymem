@@ -66,29 +66,40 @@ class CompressorOnlyTrainer(Trainer):
                 if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module")
                 else (self.model.module if hasattr(self.model, "module") else self.model)
             )
-            if self.args.process_index == 0:
-                sd = {}
-                for name, p in model_to_save.named_parameters():
-                    if ".compressor." in name:
-                        if deepspeed is not None:
-                            try:
-                                with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
+            sd = {} if self.args.process_index == 0 else None
+            for name, p in model_to_save.named_parameters():
+                if ".compressor." in name:
+                    if deepspeed is not None:
+                        try:
+                            with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
+                                if self.args.process_index == 0:
                                     if p is not None and p.data is not None and p.data.numel() > 0:
                                         sd[name] = p.data.detach().cpu().clone()
-                            except Exception:
-                                pass
-                        else:
+                        except Exception:
+                            pass
+                    else:
+                        if self.args.process_index == 0:
                             if p is not None and p.data is not None and p.data.numel() > 0:
                                 sd[name] = p.data.detach().cpu().clone()
-                if sd:
-                    path = os.path.join(out_dir, "compressor.pt")
-                    torch.save(sd, path)
-                    try:
-                        cfg = collect_compressor_config(model_to_save)
-                        with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(cfg, f, ensure_ascii=False, indent=2)
-                    except Exception:
-                        pass
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                except Exception:
+                    pass
+            if self.args.process_index == 0 and sd:
+                path = os.path.join(out_dir, "compressor.pt")
+                torch.save(sd, path)
+                try:
+                    cfg = collect_compressor_config(model_to_save)
+                    with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                except Exception:
+                    pass
         else:
             path = save_compressor_weights(self.model, out_dir)
         if self.args.process_index == 0:

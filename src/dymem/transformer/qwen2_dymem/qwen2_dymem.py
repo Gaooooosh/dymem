@@ -212,7 +212,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                 evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
                 # with torch.amp.autocast(device_type="cuda",enabled=False):
                 mem_out = self.compressor(
-                    evicted_hidden_states.float() if self.training else evicted_hidden_states,
+                    evicted_hidden_states if self.training else evicted_hidden_states,
                     cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                     cache_position=cache_position,
                 )  # [B, EVC_T, H]
