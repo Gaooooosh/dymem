@@ -106,6 +106,10 @@ def parse_args():
                         help="使用datasets的流式读取以节省内存。")
     parser.add_argument("--max_train_samples", type=int, default=0,
                         help="仅用于调试：限制训练样本数量（0表示不限制）。")
+    parser.add_argument("--shuffle", action="store_true",
+                        help="启用数据随机打乱（map式数据默认由Trainer随机采样；streaming需显式打乱）。")
+    parser.add_argument("--shuffle_buffer_size", type=int, default=10000,
+                        help="streaming 模式下的打乱缓冲区大小。")
 
     # 序列与批大小
     parser.add_argument("--max_seq_len", type=int, default=4096,
@@ -182,6 +186,11 @@ def build_dataset(tokenizer, args):
         ds = load_dataset(args.dataset_name, split=split, streaming=args.streaming)
         if args.streaming and args.dataset_limit and args.dataset_limit > 0:
             ds = ds.take(args.dataset_limit)
+    if args.shuffle:
+        if args.streaming:
+            ds = ds.shuffle(buffer_size=args.shuffle_buffer_size, seed=args.seed)
+        else:
+            ds = ds.shuffle(seed=args.seed)
     text_col = pick_text_column(ds)
 
     # tokenization
