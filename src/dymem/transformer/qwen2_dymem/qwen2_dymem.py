@@ -139,6 +139,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             n_groups=self.num_kv_groups,
             chunk_size=config.chunk_size,
         )
+        self.use_compress = getattr(config, 'use_compressor', True)
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -207,36 +208,37 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             keep_window_len = w
             evict_end_index = max(0, T - keep_window_len)
             overflow = max(0, evict_end_index - sink_len)
-            if self.compressor is not None and overflow > 0:
-                # 正确的被压缩段：去掉前端 sink 与末端滑窗，中间段作为被驱逐 token
-                evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
-                # with torch.amp.autocast(device_type="cuda",enabled=False):
-                mem_out = self.compressor(
-                    evicted_hidden_states if self.training else evicted_hidden_states,
-                    cache_params=past_key_value.mem_cache if past_key_value is not None else None,
-                    cache_position=cache_position,
-                )  # [B, EVC_T, H]
-                mem_act = mem_out[:, -1:, :] # [B, 1, H]
+            if self.compressor is not None and self.use_compress:
+                if overflow > 0:
+                    # 正确的被压缩段：去掉前端 sink 与末端滑窗，中间段作为被驱逐 token
+                    evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
+                    # with torch.amp.autocast(device_type="cuda",enabled=False):
+                    mem_out = self.compressor(
+                        evicted_hidden_states if self.training else evicted_hidden_states,
+                        cache_params=past_key_value.mem_cache if past_key_value is not None else None,
+                        cache_position=cache_position,
+                    )  # [B, EVC_T, H]
+                    mem_act = mem_out[:, -1:, :] # [B, 1, H]
 
-                if past_key_value is not None:
-                    past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
-                    past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
+                    if past_key_value is not None:
+                        past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
+                        past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
 
-                prenormed_hidden = torch.cat(
-                    [
-                        prenormed_hidden[:, :sink_len + 1, :], # +1 给mem预留长度
-                        # mem_act.to(prenormed_hidden.device),
-                        prenormed_hidden[:, evict_end_index:, :],  # 保留末端滑窗
-                    ],
-                    dim=1,
-                )
-                position_embeddings = (
-                    torch.cat([position_embeddings[0][:, :sink_len+1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
-                    torch.cat([position_embeddings[1][:, :sink_len+1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
-                )
+                    prenormed_hidden = torch.cat(
+                        [
+                            prenormed_hidden[:, :sink_len + 1, :], # +1 给mem预留长度
+                            # mem_act.to(prenormed_hidden.device),
+                            prenormed_hidden[:, evict_end_index:, :],  # 保留末端滑窗
+                        ],
+                        dim=1,
+                    )
+                    position_embeddings = (
+                        torch.cat([position_embeddings[0][:, :sink_len+1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
+                        torch.cat([position_embeddings[1][:, :sink_len+1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
+                    )
 
-            elif past_key_value is not None and T > sink_len:
-                    past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len+1:, :], self.layer_idx)
+                elif past_key_value is not None and T > sink_len:
+                        past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len+1:, :], self.layer_idx)
 
         else:
             # decode
@@ -245,7 +247,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                 layer_cache = past_key_value.hidden_cache.layers[self.layer_idx]
 
                 # 2) 若需要，先压缩这些视图；跨回绕时顺序馈入压缩器即可
-                if self.compressor is not None:
+                if self.compressor is not None and self.use_compress:
                     ev_views = layer_cache.eviction_slices(prenormed_hidden.shape[1])  # T==1 -> 1
                     if ev_views:
                         # with torch.amp.autocast(device_type="cuda", enabled=False):

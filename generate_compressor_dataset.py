@@ -50,14 +50,14 @@ DEFAULT_NUM_D = 25
 USE_LOONG_C4_DEFAULT = True
 
 # Sink token count (training side will prepend [sink_token] * SINK_N automatically).
-SINK_N_DEFAULT = 32
+SINK_N_DEFAULT = 128
 
 # Tokenizer controls (optional precise token budgeting)
 USE_TOKENIZER_DEFAULT = True
-TOKENIZER_NAME_DEFAULT = "Qwen/Qwen2.5-3B"
+TOKENIZER_NAME_DEFAULT = "Qwen/Qwen2.5-3B-Instruct"
 
 # Token-length budgets (precise, preferred when tokenizer is available)
-EVICTED_MIN_TOKENS = 800
+EVICTED_MIN_TOKENS = 3000
 EVICTED_MAX_TOKENS = 4000
 NOISE_MIN_TOKENS = 2000
 NOISE_MAX_TOKENS = 6000
@@ -416,10 +416,71 @@ def write_jsonl_line(fh, sample: Dict[str, Any]) -> None:
 # Sample type generators
 # -----------------------------
 
-COLORS = ["RED", "BLUE", "GREEN", "YELLOW", "PURPLE", "ORANGE", "CYAN", "MAGENTA", "BLACK", "WHITE"]
-CITIES = ["LONDON", "PARIS", "TOKYO", "BERLIN", "MADRID", "ROME", "DUBLIN", "SYDNEY", "TORONTO", "SINGAPORE"]
-COUNTRIES = ["UK", "FRANCE", "JAPAN", "GERMANY", "SPAIN", "ITALY", "IRELAND", "AUSTRALIA", "CANADA", "SINGAPORE"]
-NAMES = ["alice", "bob", "charlie", "diana", "edgar", "fiona", "george", "helen", "ivan", "julia", "marcus", "lee"]
+COLORS = [
+    "RED", "BLUE", "GREEN", "YELLOW", "PURPLE", "ORANGE", "CYAN", "MAGENTA", "BLACK", "WHITE",
+    "PINK", "BROWN", "GRAY", "SILVER", "GOLD", "BEIGE", "MAROON", "NAVY", "TEAL", "OLIVE",
+    "LIME", "INDIGO", "VIOLET", "TURQUOISE", "AQUA", "AMBER", "BRONZE", "COPPER", "CRIMSON", "SCARLET",
+    "CHARCOAL", "KHAKI", "TAUPE", "PEACH", "APRICOT", "CORAL", "SALMON", "MINT", "EMERALD", "JADE",
+    "SAPPHIRE", "RUBY", "TOPAZ", "AZURE", "CERULEAN", "COBALT", "IVORY", "LAVENDER", "PLUM", "MUSTARD",
+    "FUCHSIA", "SEPIA", "SLATE", "SKY BLUE", "SEAFOAM", "FOREST GREEN", "MIDNIGHT BLUE", "STEEL BLUE", "SAND",
+    "CHOCOLATE", "CHESTNUT", "BURGUNDY", "MAUVE", "ROSE", "PEARL", "SMOKE", "SUNSET", "SUNRISE"
+]
+CITIES = [
+    "LONDON", "PARIS", "TOKYO", "BERLIN", "MADRID", "ROME", "DUBLIN", "SYDNEY", "TORONTO", "SINGAPORE",
+    "NEW YORK", "LOS ANGELES", "SAN FRANCISCO", "CHICAGO", "HOUSTON", "MIAMI", "SEATTLE", "BOSTON", "WASHINGTON", "PHILADELPHIA",
+    "ATLANTA", "DETROIT", "BALTIMORE", "PHOENIX", "LAS VEGAS", "DALLAS", "AUSTIN", "SAN DIEGO", "SAN JOSE", "MEXICO CITY",
+    "BUENOS AIRES", "SANTIAGO", "RIO DE JANEIRO", "SAO PAULO", "LIMA", "BOGOTA", "CARACAS", "QUITO", "MEDELLIN", "CAPE TOWN",
+    "JOHANNESBURG", "NAIROBI", "CAIRO", "ALGIERS", "CASABLANCA", "ACCRA", "LAGOS", "ABUJA", "ADDIS ABABA", "DOHA",
+    "DUBAI", "ABU DHABI", "RIYADH", "JEDDAH", "KUWAIT CITY", "MANAMA", "MUSCAT", "TEHRAN", "ANKARA", "ISTANBUL",
+    "MOSCOW", "SAINT PETERSBURG", "WARSAW", "PRAGUE", "BUDAPEST", "VIENNA", "ZURICH", "GENEVA", "MUNICH", "FRANKFURT",
+    "HAMBURG", "COLOGNE", "AMSTERDAM", "ROTTERDAM", "BRUSSELS", "OSLO", "STOCKHOLM", "HELSINKI", "COPENHAGEN", "REYKJAVIK",
+    "ATHENS", "BARCELONA", "VALENCIA", "SEVILLE", "LISBON", "PORTO", "BELGRADE", "SOFIA", "BUCHAREST", "TIRANA",
+    "TBILISI", "YEREVAN", "BAKU", "ALMATY", "ASTANA", "BANGKOK", "HANOI", "HO CHI MINH CITY", "PHNOM PENH", "VIENTIANE",
+    "YANGON", "KUALA LUMPUR", "JAKARTA", "MANILA", "TAIPEI", "SEOUL", "BUSAN", "BEIJING", "SHANGHAI", "GUANGZHOU",
+    "SHENZHEN", "CHENGDU", "HANGZHOU", "WUHAN", "NANJING", "XIAN", "CHONGQING", "SUZHOU", "NINGBO", "TIANJIN",
+    "ZHENGZHOU", "SHIJIAZHUANG", "XIAMEN", "FUZHOU", "NANCHANG", "CHANGSHA", "HAIKOU", "HARBIN", "CHANGCHUN", "DALIAN",
+    "QINGDAO", "JINAN", "URUMQI", "LANZHOU"
+]
+COUNTRIES = [
+    "UK", "FRANCE", "JAPAN", "GERMANY", "SPAIN", "ITALY", "IRELAND", "AUSTRALIA", "CANADA", "SINGAPORE",
+    "UNITED STATES", "CHINA", "INDIA", "BRAZIL", "RUSSIA", "MEXICO", "ARGENTINA", "CHILE", "PERU", "COLOMBIA",
+    "SOUTH AFRICA", "EGYPT", "NIGERIA", "KENYA", "TURKEY", "SAUDI ARABIA", "UNITED ARAB EMIRATES", "QATAR", "KUWAIT", "BAHRAIN",
+    "OMAN", "IRAN", "IRAQ", "ISRAEL", "JORDAN", "LEBANON", "SYRIA", "GREECE", "PORTUGAL", "NETHERLANDS",
+    "BELGIUM", "SWITZERLAND", "AUSTRIA", "POLAND", "CZECHIA", "HUNGARY", "ROMANIA", "BULGARIA", "SERBIA", "CROATIA",
+    "SLOVENIA", "SLOVAKIA", "UKRAINE", "BELARUS", "LITHUANIA", "LATVIA", "ESTONIA", "NORWAY", "SWEDEN", "FINLAND",
+    "DENMARK", "ICELAND", "MALTA", "CYPRUS", "LUXEMBOURG", "MONACO", "ANDORRA", "SAN MARINO", "VATICAN", "MOROCCO",
+    "ALGERIA", "TUNISIA", "LIBYA", "ETHIOPIA", "GHANA", "IVORY COAST", "SENEGAL", "TANZANIA", "UGANDA", "ZAMBIA",
+    "ZIMBABWE", "ANGOLA", "MOZAMBIQUE", "NAMIBIA", "BOTSWANA", "CAMEROON", "CONGO", "DR CONGO", "SUDAN", "SOUTH SUDAN",
+    "PAKISTAN", "BANGLADESH", "SRI LANKA", "NEPAL", "BHUTAN", "MONGOLIA", "LAOS", "CAMBODIA", "VIETNAM", "THAILAND",
+    "MALAYSIA", "INDONESIA", "PHILIPPINES", "TAIWAN", "SOUTH KOREA", "NORTH KOREA", "NEW ZEALAND", "UNITED KINGDOM"
+]
+NAMES = [
+    "alice", "bob", "charlie", "diana", "edgar", "fiona", "george", "helen", "ivan", "julia", "marcus", "lee",
+    "aaron", "abby", "adam", "adrian", "albert", "alexa", "alex", "alfred", "alina", "allen", "amber", "amy",
+    "andrew", "angel", "angela", "anna", "anne", "anthony", "arthur", "ava", "barbara", "ben", "benjamin", "beth",
+    "betty", "blake", "brad", "brandon", "brenda", "brian", "brittany", "brooke", "bruce", "cameron", "carla",
+    "carlos", "carmen", "caroline", "carter", "catherine", "charles", "chelsea", "chris", "christopher", "cindy",
+    "claire", "clark", "claudia", "cole", "colin", "connie", "craig", "dan", "daniel", "danny", "david", "dawn",
+    "dean", "deborah", "dennis", "derek", "diane", "donald", "donna", "doris", "doug", "douglas", "dylan", "edmund",
+    "edward", "elaine", "elena", "eleanor", "eli", "eliza", "elizabeth", "ellen", "emily", "emma", "eric", "erika",
+    "ethan", "eva", "evan", "frank", "fred", "gabriel", "gary", "gerald", "gina", "gloria", "grant", "greg",
+    "gregory", "hannah", "harold", "harry", "henry", "holly", "ian", "irene", "isaac", "isabel", "jack", "jacob",
+    "jade", "james", "jamie", "janet", "jane", "jason", "jeff", "jeffrey", "jennifer", "jenny", "jeremy", "jerry",
+    "jesse", "jessica", "jim", "joan", "joanna", "joe", "joel", "john", "johnny", "jon", "jonathan", "jose",
+    "joseph", "josh", "joshua", "joy", "juan", "judy", "julian", "julie", "justin", "karen", "karl", "kate",
+    "katherine", "kathy", "keith", "kelly", "kevin", "kim", "kristin", "kylie", "laura", "lauren", "leo", "leon",
+    "leonard", "leslie", "liam", "linda", "lisa", "liz", "logan", "lois", "louis", "lucas", "lucy", "luke",
+    "lydia", "madison", "maria", "marie", "mark", "martha", "martin", "marvin", "mary", "mason", "matt", "matthew",
+    "megan", "melanie", "melissa", "micah", "michael", "michelle", "miguel", "mike", "morgan", "nancy", "natasha",
+    "nathan", "neil", "nicholas", "nick", "nicole", "noah", "olivia", "oscar", "owen", "paige", "pam", "pamela",
+    "patricia", "patrick", "paul", "paula", "peter", "phil", "philip", "phoebe", "rachel", "rafael", "ralph",
+    "ray", "raymond", "rebecca", "richard", "riley", "rita", "robert", "robin", "roger", "roland", "ron", "ronald",
+    "rose", "roy", "ruby", "russell", "ryan", "sam", "samantha", "samuel", "sara", "sarah", "scott", "sean",
+    "selena", "serena", "shane", "sharon", "sheila", "sophia", "stacey", "stanley", "stephanie", "stephen", "steve",
+    "steven", "sue", "susan", "suzanne", "sydney", "taylor", "terry", "thomas", "tim", "timothy", "tina", "todd",
+    "tom", "tony", "tracy", "travis", "tyler", "valerie", "vanessa", "victor", "victoria", "vincent", "virginia",
+    "wesley", "william", "wills", "wilson", "winston", "xavier", "yolanda", "zach", "zachary"
+]
 
 
 def _random_phrase(min_words: int = 1, max_words: int = 8) -> str:
