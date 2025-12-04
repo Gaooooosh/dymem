@@ -30,7 +30,7 @@ def freeze_backbone_except_compressor(model: torch.nn.Module):
     - 或者名字里出现 "compress"（宽松）
     - 或者可能用于 AHN 的关键字（ahn, mamba）
     """
-    train_keywords = ("compressor", "compress", "ahn", "mamba")
+    train_keywords = ("compressor", "compress", "ahn", "mamba", "mem_norm")
     total, trainable = 0, 0
     hit_names = []
 
@@ -425,6 +425,19 @@ def reinit_compressor(model, verbose=True,
             except Exception:
                 pass
 
+    mem_touched = 0
+    for name, module in model.named_modules():
+        if "mem_norm" in name.lower():
+            if hasattr(module, "weight") and module.weight is not None:
+                init.ones_(module.weight)
+            if hasattr(module, "bias") and module.bias is not None:
+                init.zeros_(module.bias)
+            if hasattr(module, "eps"):
+                module.eps = max(getattr(module, "eps", 1e-5), 1e-5)
+            if hasattr(module, "variance_epsilon"):
+                module.variance_epsilon = max(getattr(module, "variance_epsilon", 1e-6), 1e-6)
+            mem_touched += 1
+
     # 不再强制将 compressor 的敏感参数置为 FP32，遵循全局 dtype
     # for n, p in model.named_parameters():
     #     if "compressor" in n and any(k in n for k in ["A_log", "dt_bias"]):
@@ -434,6 +447,7 @@ def reinit_compressor(model, verbose=True,
         print(f"[reinit_compressor_with_mamba2_style] 触达模块: {len(modules_seen)}，已初始化 {touched}/{total} 个 compressor 子模块；"
               f"策略: Linear/Conv/Emb ~ N(0,{w_std}), Norm→(1,0), A_log→logspace[{a_min},{a_max}], "
               f"dt_proj.weight=0 & bias=inv_softplus(geo({dt_min},{dt_max})), dt_bias=0")
+        print(f"[reinit_mem_norm] 已初始化 {mem_touched} 个 mem_norm 模块")
 
 
 class ResetMemCallback(TrainerCallback):

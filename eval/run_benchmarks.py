@@ -79,7 +79,7 @@ def generate_one(
 
 
 def score_longbench(name: str, pred: str, label: str, all_classes=None, zh: bool = False):
-    from eval.metrics import (
+    from metrics import (
         qa_f1_score,
         qa_f1_zh_score,
         rouge_score,
@@ -269,13 +269,18 @@ def main():
     p.add_argument("--results_dir", type=str, default=None)
     p.add_argument("--force_run", action="store_true")
     p.add_argument("--exclude_or", action="store_true")
+    p.add_argument("--device", type=str, default=None)
     args = p.parse_args()
 
     seed_everything(args.seed)
-    device = torch.device(
-        os.environ.get("CUDA_DEVICE", "cuda:6") if torch.cuda.is_available() else "cpu"
-    )
-    if torch.cuda.is_available():
+    if args.device is not None:
+        try:
+            device = torch.device(args.device)
+        except Exception:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.set_device(device)
     model, tok = load_model_and_tokenizer(args.model_path, device)
     model.config.sliding_window = args.sliding_window

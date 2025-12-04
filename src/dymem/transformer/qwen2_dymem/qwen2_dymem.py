@@ -118,7 +118,7 @@ class ChunkDecisionHead(nn.Module):
 
 class Qwen2AttentionWithMem(Qwen2Attention):
     """在 Qwen2Attention 基础上，加入四段式 KV 与 SSM-ActiveMem 逻辑，并以 flex_attention 计算注意力。"""
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int,norm:Qwen2RMSNorm):
         super().__init__(config=config, layer_idx=layer_idx)
         self.config = config
         self.layer_idx = layer_idx
@@ -140,6 +140,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             chunk_size=config.chunk_size,
         )
         self.use_compress = getattr(config, 'use_compressor', True)
+        self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -198,6 +199,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         B, T, H = prenormed_hidden.shape
+        self.sliding_window = self.config.sliding_window
         # 预填充阶段可能会更改序列长度，先处理压缩拼接，再计算投影视图形状
         mem_act = None # the mem_tensor that is used to attend to the current token
         mem_out = None # mem_out is the output hidden_state of compressor
@@ -285,15 +287,18 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         if mem_act is not None:
             sink_len = self.num_attn_sinks
             mem_hidden_shape = (B, 1, -1, self.head_dim)
+            mem_act = self.mem_norm(mem_act)
             mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
             mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
 
             # mem_q, mem_k = apply_rotary_pos_emb(mem_q, mem_k, cos, sin)
-            key_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_k[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_k[:,:,0,:]
+            # key_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_k[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_k[:,:,0,:]
+            key_states[:,:,sink_len,:] = mem_k[:,:,0,:]
             value_states[:,:,sink_len,:] = mem_v[:,:,0,:]
             if T > 1:
                 mem_q = self.q_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
-                query_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_q[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_q[:,:,0,:]
+                # query_states[:,:,sink_len,:] = self.apply_rotary_emb_single(mem_q[:,:,0,:], past_key_value.mem_position_embed[-1]) if past_key_value else mem_q[:,:,0,:]
+                query_states[:,:,sink_len,:] = mem_q[:,:,0,:]
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -331,10 +336,10 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.self_attn = Qwen2AttentionWithMem(config, layer_idx)
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Qwen2AttentionWithMem(config, layer_idx, self.input_layernorm)
         self._do_solidify_next = False
 
     def mark_solidify(self):
