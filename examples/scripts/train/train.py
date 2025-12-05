@@ -79,6 +79,7 @@ from untils import (
     set_sliding_window,
     save_compressor_weights,
     load_compressor_weights,
+    collect_compressor_state_dict,
     RandomSlidingWindowCallback,
     ResetMemCallback,
     reinit_compressor,
@@ -280,6 +281,14 @@ class CompressorOnlyTrainer(Trainer):
                 path = os.path.join(out_dir, "compressor.pt")
                 torch.save(sd, path)
                 try:
+                    if getattr(self.args, "save_safetensors", True):
+                        from safetensors.torch import save_file
+                        save_file(sd, os.path.join(out_dir, "model.safetensors"))
+                    else:
+                        torch.save(sd, os.path.join(out_dir, "pytorch_model.bin"))
+                except Exception:
+                    pass
+                try:
                     from untils import collect_compressor_config
                     cfg = collect_compressor_config(model_to_save)
                     with open(os.path.join(out_dir, "compressor_config.json"), "w", encoding="utf-8") as f:
@@ -294,6 +303,15 @@ class CompressorOnlyTrainer(Trainer):
                     pass
         else:
             path = save_compressor_weights(self.model, out_dir)
+            try:
+                sd_local = collect_compressor_state_dict(self.model)
+                if getattr(self.args, "save_safetensors", True):
+                    from safetensors.torch import save_file
+                    save_file(sd_local, os.path.join(out_dir, "model.safetensors"))
+                else:
+                    torch.save(sd_local, os.path.join(out_dir, "pytorch_model.bin"))
+            except Exception:
+                pass
         if self.args.process_index == 0:
             self.state.save_to_json(os.path.join(out_dir, "trainer_state.json"))
             if self.args.should_save:
@@ -320,6 +338,7 @@ def main():
     # 切换到带记忆压缩器的层实现
     config._layer_implementation = "Qwen2DyMemDecoderLayer"
     config._ahn_implementation = "Mamba2"
+    config.attn_implementation = "flash_attention_2"
     config.use_compressor = True
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
@@ -474,6 +493,22 @@ def main():
         subs.sort(key=lambda x: x[0])
         return subs[-1][1]
 
+    def _has_hf_model_files(checkpoint_dir: str) -> bool:
+        if not os.path.isdir(checkpoint_dir):
+            return False
+        names = [
+            "pytorch_model.bin",
+            "model.safetensors",
+            "pytorch_model.bin.index.json",
+        ]
+        for n in names:
+            if os.path.isfile(os.path.join(checkpoint_dir, n)):
+                return True
+        return False
+
+    def _has_trainer_state(checkpoint_dir: str) -> bool:
+        return os.path.isfile(os.path.join(checkpoint_dir, "trainer_state.json"))
+
     resume_path = None
     if args.resume_from_checkpoint:
         resume_path = args.resume_from_checkpoint
@@ -487,7 +522,7 @@ def main():
                 load_compressor_weights(model, cpath, strict=False)
             except Exception:
                 pass
-        if os.path.isdir(resume_path):
+        if os.path.isdir(resume_path) and _has_hf_model_files(resume_path) and _has_trainer_state(resume_path):
             trainer.train(resume_from_checkpoint=resume_path)
         else:
             trainer.train()

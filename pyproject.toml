@@ -24,6 +24,7 @@ dependencies = [
     "transformers>=4.57.1",
     "wandb>=0.22.2",
     "gradio>=4.0.0",
+    "lm-eval>=0.4.9.2",
 ]
 
 [tool.setuptools]
@@ -42,7 +43,7 @@ members = [
 [tool.uv.sources]
 dymem = { workspace = true }
 causal-conv1d = { path = "causal_conv1d-1.5.4+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
-flash-attn = { path = "flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
+flash-attn = { path = "flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl" }
 
 [dependency-groups]
 dev = [

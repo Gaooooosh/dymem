@@ -117,8 +117,8 @@ class ChunkDecisionHead(nn.Module):
         return self.proj(feat)  # [B,1]
 
 class Qwen2AttentionWithMem(Qwen2Attention):
-    """在 Qwen2Attention 基础上，加入四段式 KV 与 SSM-ActiveMem 逻辑，并以 flex_attention 计算注意力。"""
-    def __init__(self, config, layer_idx: int,norm:Qwen2RMSNorm):
+
+    def __init__(self, config, layer_idx: int):
         super().__init__(config=config, layer_idx=layer_idx)
         self.config = config
         self.layer_idx = layer_idx
@@ -127,7 +127,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.num_attn_sinks = getattr(config, 'num_attn_sinks', 128)
-        self.sliding_window = getattr(config, 'sliding_window', 256)
+        self.sliding_window = getattr(config, 'sliding_window', 2048)
         self.mem_max_len = getattr(config, 'mem_max_len', 2048)
         self.compressor = Mamba2(
             num_heads=self.num_heads,
@@ -140,7 +140,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             chunk_size=config.chunk_size,
         )
         self.use_compress = getattr(config, 'use_compressor', True)
-        self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -220,8 +220,8 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                         cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                         cache_position=cache_position,
                     )  # [B, EVC_T, H]
+                    # mem_out = self.mem_norm(mem_out)
                     mem_act = mem_out[:, -1:, :] # [B, 1, H]
-
                     if past_key_value is not None:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
                         past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
@@ -261,7 +261,8 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                                     cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                                     cache_position=cache_position,
                                 )
-                            mem_act = mem_out_step[:, -1:, :]  # [B, 1, H]
+                            # mem_out_step = self.mem_norm(mem_out_step)
+                            mem_act = mem_out_step[:,-1:,:]
 
                 # 3) 最后再把新 token 写入缓存（O(1) 次数的切片 copy）
                 past_key_value.hidden_cache.update(prenormed_hidden, self.layer_idx)
@@ -287,7 +288,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         if mem_act is not None:
             sink_len = self.num_attn_sinks
             mem_hidden_shape = (B, 1, -1, self.head_dim)
-            mem_act = self.mem_norm(mem_act)
             mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
             mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
 
@@ -311,15 +311,23 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         causal_mask = self._local_update_causal_mask(query_states, key_states)
         if causal_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+        mask_arg = None if self.config._attn_implementation == "flash_attention_2" else causal_mask
+        fa_sliding = None
+        if (
+            getattr(self.config, "use_sliding_window", False)
+            and getattr(self.config, "sliding_window", None) is not None
+            and self.layer_idx >= getattr(self.config, "max_window_layers", 0)
+        ):
+            fa_sliding = self.config.sliding_window
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
             key_states,
             value_states,
-            causal_mask,
+            mask_arg,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=None,  # main diff with Llama
+            sliding_window=fa_sliding,  # main diff with Llama
             **kwargs,
         )
 
@@ -339,7 +347,7 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Qwen2AttentionWithMem(config, layer_idx, self.input_layernorm)
+        self.self_attn = Qwen2AttentionWithMem(config, layer_idx)
         self._do_solidify_next = False
 
     def mark_solidify(self):
