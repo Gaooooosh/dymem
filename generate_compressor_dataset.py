@@ -35,6 +35,7 @@ import sys
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # -----------------------------
@@ -57,13 +58,13 @@ USE_TOKENIZER_DEFAULT = True
 TOKENIZER_NAME_DEFAULT = "Qwen/Qwen2.5-3B-Instruct"
 
 # Token-length budgets (precise, preferred when tokenizer is available)
-EVICTED_MIN_TOKENS = 3000
-EVICTED_MAX_TOKENS = 4000
-NOISE_MIN_TOKENS = 2000
-NOISE_MAX_TOKENS = 6000
+EVICTED_MIN_TOKENS = 1000
+EVICTED_MAX_TOKENS = 3000
+NOISE_MIN_TOKENS = 1000
+NOISE_MAX_TOKENS = 2000
 QUERY_MIN_TOKENS = 50
 QUERY_MAX_TOKENS = 200
-MAX_FULL_TEXT_TOKENS = 8000
+MAX_FULL_TEXT_TOKENS = 1024*6
 
 # Char-length budgets (rough approximations to token lengths)
 EVICTED_MIN_CHARS = 4000   # ~800 tokens eq.
@@ -409,7 +410,6 @@ def write_jsonl(samples: List[Dict[str, Any]], path: Path) -> None:
 
 def write_jsonl_line(fh, sample: Dict[str, Any]) -> None:
     fh.write(json.dumps(sample, ensure_ascii=False) + "\n")
-    fh.flush()
 
 
 # -----------------------------
@@ -765,6 +765,7 @@ def main() -> None:
     parser.add_argument("--query_min_chars", type=int, default=QUERY_MIN_CHARS)
     parser.add_argument("--query_max_chars", type=int, default=QUERY_MAX_CHARS)
     parser.add_argument("--max_full_text_chars", type=int, default=MAX_FULL_TEXT_CHARS)
+    parser.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -814,55 +815,52 @@ def main() -> None:
     train_fh = train_path.open("w", encoding="utf-8")
     valid_fh = valid_path.open("w", encoding="utf-8") if n_valid > 0 else None
 
+    workers = max(1, int(args.workers))
+
     idx = 0
     n_train_written = 0
     n_valid_written = 0
 
+    executor = ThreadPoolExecutor(max_workers=workers)
+
     try:
-        for _ in _iterate(total_counts["A"], "Generating A"):
-            s = generate_sample_A(sampler, tokenizer=tokenizer)
-            validate_sample(s, tokenizer=tokenizer)
-            if idx in valid_indices and valid_fh is not None:
-                write_jsonl_line(valid_fh, s)
-                n_valid_written += 1
+        def _dispatch(kind: str, count: int):
+            nonlocal idx, n_train_written, n_valid_written
+            if count <= 0:
+                return
+            if kind == "A":
+                gen_fn = generate_sample_A
+            elif kind == "B":
+                gen_fn = generate_sample_B
+            elif kind == "C":
+                gen_fn = generate_sample_C
             else:
-                write_jsonl_line(train_fh, s)
-                n_train_written += 1
-            idx += 1
+                gen_fn = generate_sample_D
 
-        for _ in _iterate(total_counts["B"], "Generating B"):
-            s = generate_sample_B(sampler, tokenizer=tokenizer)
-            validate_sample(s, tokenizer=tokenizer)
-            if idx in valid_indices and valid_fh is not None:
-                write_jsonl_line(valid_fh, s)
-                n_valid_written += 1
-            else:
-                write_jsonl_line(train_fh, s)
-                n_train_written += 1
-            idx += 1
+            pbar = _TQDM(total=count, desc=f"Generating {kind}") if _TQDM is not None else None
+            for s in executor.map(lambda _: gen_fn(sampler, tokenizer), range(count), chunksize=max(1, workers*2)):
+                validate_sample(s, tokenizer=tokenizer)
+                if idx in valid_indices and valid_fh is not None:
+                    write_jsonl_line(valid_fh, s)
+                    n_valid_written += 1
+                else:
+                    write_jsonl_line(train_fh, s)
+                    n_train_written += 1
+                idx += 1
+                if pbar is not None:
+                    pbar.update(1)
+            if pbar is not None:
+                pbar.close()
 
-        for _ in _iterate(total_counts["C"], "Generating C"):
-            s = generate_sample_C(sampler, tokenizer=tokenizer)
-            validate_sample(s, tokenizer=tokenizer)
-            if idx in valid_indices and valid_fh is not None:
-                write_jsonl_line(valid_fh, s)
-                n_valid_written += 1
-            else:
-                write_jsonl_line(train_fh, s)
-                n_train_written += 1
-            idx += 1
-
-        for _ in _iterate(total_counts["D"], "Generating D"):
-            s = generate_sample_D(sampler, tokenizer=tokenizer)
-            validate_sample(s, tokenizer=tokenizer)
-            if idx in valid_indices and valid_fh is not None:
-                write_jsonl_line(valid_fh, s)
-                n_valid_written += 1
-            else:
-                write_jsonl_line(train_fh, s)
-                n_train_written += 1
-            idx += 1
+        _dispatch("A", total_counts["A"])
+        _dispatch("B", total_counts["B"])
+        _dispatch("C", total_counts["C"])
+        _dispatch("D", total_counts["D"])
     finally:
+        try:
+            executor.shutdown(wait=True)
+        except Exception:
+            pass
         try:
             train_fh.close()
         except Exception:
