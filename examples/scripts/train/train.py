@@ -6,44 +6,10 @@ train.py
 - 每 step 随机采样滑动注意力窗口大小，防过拟合
 - 只保存 compressor 权重（自定义 Trainer.save_model）
 
-CUDA_VISIBLE_DEVICES=6 python train.py \
-       --base_model Qwen/Qwen2.5-3B \
-        --dataset_name vllg/loong_c4 \
-        --dataset_split train \
-        --max_seq_len 4096 \
-        --per_device_train_batch_size 1 \
-        --gradient_accumulation_steps 8 \
-        --learning_rate 5e-5 \
-        --num_train_epochs 1 \
-        --bf16 \
-        --init_sliding_window 256 \
-        --sliding_window_choices 128,256,512,1024,2048,4096 \
-        --num_attn_sinks 128 \
-        --mem_max_len 1024 \
-        --output_dir outputs_dymem \
-        --tf32 \
-        --dataset_limit 100
-
-        CUDA_VISIBLE_DEVICES=0 python train.py \
-            --base_model Qwen/Qwen2.5-3B \
-            --dataset_name vllg/loong_c4 \
-            --dataset_split train \
-            --max_seq_len 4096 \
-            --per_device_train_batch_size 1 \
-            --gradient_accumulation_steps 1 \
-            --learning_rate 1e-6 \
-            --num_train_epochs 1 \
-            --init_sliding_window 128 \
-            --sliding_window_choices 128,256,512,1024,2048,4096 \
-            --num_attn_sinks 128 \
-            --mem_max_len 256 \
-            --output_dir outputs_dymem \
-            --tf32 \
-            --bf16 \
-            --dataset_limit 1000 \
-            --max_grad_norm 0.01
+CUDA_VISIBLE_DEVICES=4,5 torchrun --nproc-per-node=2 train.py --base_model Qwen/Qwen2.5-3B-Instruct --dataset_name vllg/loong_c4 --dataset_split train --max_seq_len 4096 --per_device_train_batch_size 1 --gradient_accumulation_steps 1 --learning_rate 5e-5 --num_train_epochs 1 --init_sliding_window 128 --sliding_window_choices 512,1024,2048,3176 --num_attn_sinks 128 --mem_max_len 256 --output_dir /work/xiaoyonggao/dymem3/ --tf32 --bf16 --max_grad_norm 1 --deepspeed /home/xiaoyonggao/dymem/examples/deepspeed/ds_z2_config.json --dataset_limit 50000
 """
 
+from curses import flash
 import os
 import sys
 import math
@@ -338,8 +304,8 @@ def main():
     # 切换到带记忆压缩器的层实现
     config._layer_implementation = "Qwen2DyMemDecoderLayer"
     config._ahn_implementation = "Mamba2"
-    config.attn_implementation = "flash_attention_2"
-    config.use_compressor = True
+    # config.attn_implementation = "flash_attention_2"
+    config.use_compressor = False
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
     config.mem_max_len = args.mem_max_len

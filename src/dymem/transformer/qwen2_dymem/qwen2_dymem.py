@@ -145,7 +145,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.use_compress = getattr(config, 'use_compressor', True)
         if not self.use_compress:
             logger.warning_once(f"【DyMem】- [Warning] Config does not use compressor")
-        # self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -271,7 +271,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                         cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                         cache_position=cache_position,
                     )  # [B, EVC_T, H]
-                    # mem_out = self.mem_norm(mem_out)
+                    mem_out = self.mem_norm(mem_out)
                     mem_act = mem_out[:, -1:, :] # [B, 1, H]
                     if past_key_value is not None:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
@@ -279,7 +279,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
                 elif past_key_value is not None and T > sink_len:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len+1:, :], self.layer_idx)
-
         else: # decode
             mem_act = None
             if past_key_value is not None:
@@ -296,7 +295,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                                     cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                                     cache_position=cache_position,
                                 )
-                            # mem_out_step = self.mem_norm(mem_out_step)
+                            mem_out_step = self.mem_norm(mem_out_step)
                             mem_act = mem_out_step[:,-1:,:]
 
                 # 3) 最后再把新 token 写入缓存（O(1) 次数的切片 copy）
@@ -340,6 +339,24 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         mask_arg = None if self.config._attn_implementation == "flash_attention_2" else causal_mask
+
+        if mem_act is not None and mask_arg is not None:
+            # attention_mask 形状一般是 [B, 1, Lq, Lk_total]
+            bsz, _, q_len, k_len_total = mask_arg.shape
+            k_len = key_states.shape[-2]          # 经过 cache/sliding_window 后真正参与注意力的 key 长度
+            mem_pos = self.num_attn_sinks                # 假设 mem token 在最后一个 key 位置
+
+            # 截取当前会用到的部分
+            mask_arg = mask_arg[:, :, :, :k_len]
+
+            # 构造一个全 0 bias mask，只在 mem 列加上 bias
+            Le_fact = (key_states.shape[-2] - self.num_attn_sinks - self.sliding_window) / key_states.shape[-2]
+            mem_bias_mask = torch.zeros_like(mask_arg)
+            mem_bias_mask[..., mem_pos] = 0.5 * Le_fact
+
+            # 叠加：原来的 causal mask + mem bias
+            mask_arg = mask_arg + mem_bias_mask
+
 
         attn_output, attn_weights = attention_interface(
             self,

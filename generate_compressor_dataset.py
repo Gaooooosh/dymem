@@ -58,13 +58,13 @@ USE_TOKENIZER_DEFAULT = True
 TOKENIZER_NAME_DEFAULT = "Qwen/Qwen2.5-3B-Instruct"
 
 # Token-length budgets (precise, preferred when tokenizer is available)
-EVICTED_MIN_TOKENS = 1000
+EVICTED_MIN_TOKENS = 512
 EVICTED_MAX_TOKENS = 3000
 NOISE_MIN_TOKENS = 1000
 NOISE_MAX_TOKENS = 2000
 QUERY_MIN_TOKENS = 50
 QUERY_MAX_TOKENS = 200
-MAX_FULL_TEXT_TOKENS = 1024*6
+MAX_FULL_TEXT_TOKENS = 1024*4
 
 # Char-length budgets (rough approximations to token lengths)
 EVICTED_MIN_CHARS = 4000   # ~800 tokens eq.
