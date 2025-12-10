@@ -27,7 +27,6 @@ from dymem.transformer.qwen2.modeling_qwen2 import (
 )
 
 from dymem.utils import CacheWithMem
-from fla.layers.mamba2 import Mamba2
 from dymem.rnn.mamba2 import Mamba2
 from dataclasses import dataclass
 from transformers.cache_utils import Cache, DynamicCache
@@ -145,7 +144,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.use_compress = getattr(config, 'use_compressor', True)
         if not self.use_compress:
             logger.warning_once(f"【DyMem】- [Warning] Config does not use compressor")
-        self.mem_norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
         # 段缓存
         self.register_buffer('sink_k', None, persistent=False)
         self.register_buffer('sink_v', None, persistent=False)
@@ -271,7 +269,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                         cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                         cache_position=cache_position,
                     )  # [B, EVC_T, H]
-                    mem_out = self.mem_norm(mem_out)
                     mem_act = mem_out[:, -1:, :] # [B, 1, H]
                     if past_key_value is not None:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
@@ -295,7 +292,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                                     cache_params=past_key_value.mem_cache if past_key_value is not None else None,
                                     cache_position=cache_position,
                                 )
-                            mem_out_step = self.mem_norm(mem_out_step)
                             mem_act = mem_out_step[:,-1:,:]
 
                 # 3) 最后再把新 token 写入缓存（O(1) 次数的切片 copy）
@@ -356,7 +352,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
             # 叠加：原来的 causal mask + mem bias
             mask_arg = mask_arg + mem_bias_mask
-
 
         attn_output, attn_weights = attention_interface(
             self,

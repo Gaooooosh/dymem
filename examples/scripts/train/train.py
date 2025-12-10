@@ -28,7 +28,7 @@ from transformers import (
     set_seed,
     Trainer,
 )
-
+import torch.nn.init as init
 # 若 qwen2_dymem.py 与本脚本在同一目录，确保可导入
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
 CUR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -305,7 +305,7 @@ def main():
     config._layer_implementation = "Qwen2DyMemDecoderLayer"
     config._ahn_implementation = "Mamba2"
     # config.attn_implementation = "flash_attention_2"
-    config.use_compressor = False
+    config.use_compressor = True
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
     config.mem_max_len = args.mem_max_len
@@ -323,14 +323,14 @@ def main():
         ignore_mismatched_sizes=True,
         trust_remote_code=False,
     )
-
-    target_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-    model.to(dtype=target_dtype)
+    
+    # 修复权重名称：将所有 self_attn.mem_norm.* 转换为 self_attn.compressor.mem_norm.*
 
     # 冻结 backbone，仅训练 compressor
     model.train()
     freeze_backbone_except_compressor(model)
-    reinit_compressor(model)
+    if not args.resume_from_checkpoint and not args.auto_resume:
+        reinit_compressor(model)
     # 不强制将 compressor 模块转换为 FP32，遵循全局 dtype（例如 bf16）
     for n, m in model.named_modules():
         if "compressor" in n:

@@ -157,6 +157,22 @@ def save_compressor_weights(model: torch.nn.Module, path_or_dir: str) -> str:
 def load_compressor_weights(model: torch.nn.Module, compressor_path: str, strict: bool = False):
     """将 compressor 权重加载到当前模型（strict=False 更稳妥）。"""
     sd = torch.load(compressor_path, map_location="cpu")
+    
+    # 修复权重名称：将所有 self_attn.mem_norm.* 转换为 self_attn.compressor.mem_norm.*
+    new_sd = {}
+    renamed_count = 0
+    for key, value in sd.items():
+        if "self_attn.mem_norm." in key:
+            new_key = key.replace("self_attn.mem_norm.", "self_attn.compressor.mem_norm.")
+            new_sd[new_key] = value
+            renamed_count += 1
+        else:
+            new_sd[key] = value
+    
+    if renamed_count > 0:
+        print(f"[rename] Renamed {renamed_count} mem_norm keys to compressor.mem_norm")
+        sd = new_sd
+    
     missing, unexpected = model.load_state_dict(sd, strict=strict)
     print(f"[load] compressor from {compressor_path} | missing={len(missing)} unexpected={len(unexpected)}")
     return missing, unexpected
