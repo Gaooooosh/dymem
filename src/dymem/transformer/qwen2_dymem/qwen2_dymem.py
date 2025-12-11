@@ -1,6 +1,8 @@
 from __future__ import annotations
+import os
 from math import log
 import torch
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
 import wandb
 import random
 import torch.nn as nn
@@ -128,8 +130,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.num_attn_sinks = getattr(config, 'num_attn_sinks', 128)
         self.sliding_window = getattr(config, 'sliding_window', 2048)
-        if self.sliding_window:
-            logger.warning_once(f"【DyMem】- [Warning] sliding_window set to {self.sliding_window}")
+
         self.mem_max_len = getattr(config, 'mem_max_len', 2048)
         self.compressor = Mamba2(
             num_heads=self.num_heads,
@@ -169,74 +170,21 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
     def _local_update_causal_mask(self, query_states, key_states):
         q_len = query_states.shape[2]
+        if q_len==1:
+            return None
+
         k_len = key_states.shape[2]
-    
+
         dtype = query_states.dtype
         device = query_states.device
-        
-        # 获取配置参数
-        sliding_window = getattr(self.config, 'sliding_window', None)
-        num_attn_sinks = getattr(self.config, 'num_attn_sinks', 0)
-        
-        # 确定“受保护区域”长度 (Sink + Memory)
-        # 假设 Memory 紧跟在 Sink 之后。如果 k_len 很短说明还没产生 Memory，mem_len=0
-        mem_len = 1 if (self.use_compress and k_len > num_attn_sinks) else 0
-        protected_len = num_attn_sinks + mem_len
+        min_val = torch.finfo(dtype).min
 
-        # =====================================================
-        # Case 1: Decoding (q_len == 1)
-        # =====================================================
-        if q_len == 1:
-            # 如果没有定义滑窗，或者滑窗甚至比当前总长度还长，就不需要 Mask
-            if sliding_window is None or sliding_window <= 0 or k_len <= (protected_len + sliding_window):
-                return None
-            
-            # 初始化 Mask [1, 1, 1, k_len]
-            # 注意：Decoding 时 Q 只有一个，所以 dim=2 是 1
-            mask = torch.zeros((1, 1, 1, k_len), device=device, dtype=dtype)
-            
-            # 我们只需要判断 Key 的位置 (col_idx)
-            col_idx = torch.arange(k_len, device=device)[None, None, :] # [1, 1, k_len]
-            
-            # Mask 逻辑：
-            # 我们要 Mask 掉的是中间那段“被遗忘的区域”。
-            # 条件 A: 它不在左边的受保护区 (col >= protected_len)
-            # 条件 B: 它不在右边的滑动窗口内 (col < k_len - sliding_window)
-            # 注意：最新的 token 索引是 k_len-1，所以窗口起始点是 k_len - sliding_window
-            
-            mask_cond = (col_idx >= protected_len) & (col_idx < (k_len - sliding_window))
-            
-            min_val = torch.finfo(dtype).min
-            mask.masked_fill_(mask_cond, min_val)
-            
-            return mask
-
-        # =====================================================
-        # Case 2: Prefilling (q_len > 1)
-        # =====================================================
-        else:
-            # 基础全 0 Mask
-            mask = torch.full((q_len, k_len), 0, device=device, dtype=dtype)
-            min_val = torch.finfo(dtype).min
-
-            if sliding_window is not None and sliding_window > 0:
-                row_idx = torch.arange(q_len, device=device)[:, None]
-                col_idx = torch.arange(k_len, device=device)[None, :]
-                
-                # 1. 因果性 (不能看未来)
-                causal_mask = col_idx > row_idx
-                
-                # 2. 滑窗限制 (不能看太旧)
-                # 只有当它既不是 Sink 也不是 Memory 时，才受窗口限制
-                window_mask = (col_idx < (row_idx - sliding_window)) & (col_idx >= protected_len)
-                
-                final_mask_cond = causal_mask | window_mask
-                mask.masked_fill_(final_mask_cond, min_val)
-            else:
-                # 标准因果 Mask
-                mask.masked_fill_(torch.ones_like(mask, dtype=torch.bool).triu_(1), min_val)
-            
-            return mask[None, None, :, :]
+        # [Lq, Lk]
+        mask = torch.zeros((q_len, k_len), device=device, dtype=dtype)
+        # 上三角（严格）置为 -inf，实现因果性
+        mask.masked_fill_(torch.ones_like(mask, dtype=torch.bool).triu_(1), min_val)
+        # 变成 [1,1,Lq,Lk]
+        return mask[None, None, :, :]
 
     def forward(
         self,
@@ -266,15 +214,23 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                     evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
                     mem_out = self.compressor(
                         evicted_hidden_states if self.training else evicted_hidden_states,
-                        cache_params=past_key_value.mem_cache if past_key_value is not None else None,
+                        cache_params=past_key_value.mem_cache if (self.config.use_cache and past_key_value is not None) else None,
                         cache_position=cache_position,
                     )  # [B, EVC_T, H]
                     mem_act = mem_out[:, -1:, :] # [B, 1, H]
-                    if past_key_value is not None:
-                        past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
-                        # past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
 
-                elif past_key_value is not None and T > sink_len:
+                    if past_key_value is not None and self.config.use_cache:
+                        past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
+                        past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
+
+                    prenormed_hidden = torch.cat([prenormed_hidden[:, :sink_len + 1, :], prenormed_hidden[:, evict_end_index:, :],],dim=1,)
+                    
+                    position_embeddings = (
+                        torch.cat([position_embeddings[0][:, :sink_len+1, :], position_embeddings[0][:, evict_end_index:, :]], dim=1),
+                        torch.cat([position_embeddings[1][:, :sink_len+1, :], position_embeddings[1][:, evict_end_index:, :]], dim=1),
+                    )
+
+                elif past_key_value is not None and T > sink_len and self.config.use_cache:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,sink_len+1:, :], self.layer_idx)
         else: # decode
             mem_act = None
@@ -289,13 +245,19 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                             for evt in ev_views:
                                 mem_out_step = self.compressor(
                                     evt,
-                                    cache_params=past_key_value.mem_cache if past_key_value is not None else None,
+                                    cache_params=past_key_value.mem_cache if self.config.use_cache else None,
                                     cache_position=cache_position,
                                 )
                             mem_act = mem_out_step[:,-1:,:]
 
                 # 3) 最后再把新 token 写入缓存（O(1) 次数的切片 copy）
                 past_key_value.hidden_cache.update(prenormed_hidden, self.layer_idx)
+
+
+        # 压缩拼接后重新计算形状并保证连续性
+        B, T, H = prenormed_hidden.shape # prefilling stage: the len will be sliding_window + 1 when mem_act is not None, the extra one position is pre-alloc for mem_qkv
+        input_shape = prenormed_hidden.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
         # 线性投影 
         q_states = self.q_proj(prenormed_hidden).view(hidden_shape).transpose(1, 2) # [B, H, T, D]
@@ -315,7 +277,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             mem_hidden_shape = (B, 1, -1, self.head_dim)
             mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
             mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
-
+            # mem_q,mem_k = apply_rotary_pos_emb(mem_q, mem_k, *past_key_value.mem_position_embed[-1])
             key_states[:,:,sink_len,:] = mem_k[:,:,0,:]
             value_states[:,:,sink_len,:] = mem_v[:,:,0,:]
             if T > 1:
@@ -335,7 +297,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
         mask_arg = None if self.config._attn_implementation == "flash_attention_2" else causal_mask
-
+        
         if mem_act is not None and mask_arg is not None:
             # attention_mask 形状一般是 [B, 1, Lq, Lk_total]
             bsz, _, q_len, k_len_total = mask_arg.shape
@@ -348,7 +310,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             # 构造一个全 0 bias mask，只在 mem 列加上 bias
             Le_fact = (key_states.shape[-2] - self.num_attn_sinks - self.sliding_window) / key_states.shape[-2]
             mem_bias_mask = torch.zeros_like(mask_arg)
-            mem_bias_mask[..., mem_pos] = 0.5 * Le_fact
+            mem_bias_mask[..., mem_pos] = 5 * Le_fact
 
             # 叠加：原来的 causal mask + mem bias
             mask_arg = mask_arg + mem_bias_mask
@@ -364,25 +326,11 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             sliding_window=self.sliding_window,
             **kwargs,
         )
-
+        # 将 [B, T, heads, head_dim] 转为 [B, T, heads*head_dim]
         attn_output = attn_output.reshape(B, T, -1)
         if mem_out is not None:
-            if T > 1 and not self.training:
-                attn_output[:,sink_len+1:T-w,:] = mem_out[:,:-1,:]
-            else :
-                # 1. 取出 Sink 部分 (保留 Attention 结果)
-                out_sink = attn_output[:, :sink_len, :]
-                
-                # 2. 中间部分直接用 mem_out (Mamba 输出)
-                # 注意：需确保 mem_out 形状与被替换部分一致
-                out_mem = mem_out 
-                
-                # 3. 取出 Window 部分 (保留 Attention 结果)
-                # T-w 就是 evict_end_index
-                out_window = attn_output[:, T-w:, :]
-                
-                # 4. 拼接 (Out-of-place 操作，安全)
-                attn_output = torch.cat([out_sink, out_mem, out_window], dim=1)
+            if T > 1:
+                attn_output = torch.cat([attn_output[:,:sink_len,:], mem_out[:,:-1,:], attn_output[:,sink_len:,:]], dim=1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

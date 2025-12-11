@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+from re import T
 import torch
 import torch.nn as nn
 from typing import Optional, Any, override, Union
@@ -91,9 +92,10 @@ class GroupLinear(nn.Module):
         )  # (B, L, out_features)
         return out
 
-# def is_torchdynamo_compiling() -> Union[tuple[bool, str], bool]:
-#     if not torch.cuda.is_available():
-#         return False
+def is_torchdynamo_compiling() -> Union[tuple[bool, str], bool]:
+    return True
+    if not torch.cuda.is_available():
+        return False
 
 class StaticSlidingWindowLayerHiddenOnly(StaticSlidingWindowLayer):
     is_sliding = True
@@ -441,9 +443,8 @@ class StaticSlidingWindowLayerWithSink(StaticLayer):
         v_out = torch.cat([v_sink_mem, v_window_out], dim=2)
         
         return k_out, v_out
-class CacheWithMem(DynamicCache):
+class CacheWithMem(StaticCache):
     def __init__(self, config: PretrainedConfig, dtype: Optional[torch.dtype] = None, device: Optional[torch.device] = None, *args, **kwargs):
-        super().__init__(config=config, *args, **kwargs)
         num_heads = config.num_attention_heads
         head_dim = config.hidden_size // config.num_attention_heads
         num_kv_groups = num_heads // config.num_key_value_heads
@@ -467,8 +468,9 @@ class CacheWithMem(DynamicCache):
         self.mem_position_embed = []
         self.mem_cache = Mamba2Cache(mamba_config, batch_size=kwargs.get('max_batch_size', 1), dtype=dtype, device=device, *args, **kwargs)
         self.hidden_cache = StaticHiddenCache(config, *args, **kwargs)
-        # config = config.get_text_config(decoder=True)
-        # self.layers = []
-        # for layer_idx in range(config.num_hidden_layers):
-        #     layer = StaticSlidingWindowLayerWithSink(config.num_attn_sinks, config.sliding_window)
-        #     self.layers.append(layer)
+        super().__init__(config, max_cache_len=config.sliding_window + 1 + config.num_attn_sinks, *args, **kwargs)
+        config = config.get_text_config(decoder=True)
+        self.layers = []
+        for layer_idx in range(config.num_hidden_layers):
+            layer = StaticSlidingWindowLayerWithSink(config.num_attn_sinks, config.sliding_window)
+            self.layers.append(layer)
