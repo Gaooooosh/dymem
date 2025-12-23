@@ -7,8 +7,10 @@ import torch.nn as nn
 from typing import Optional, Any, override, Union
 from transformers import StaticSlidingWindowLayer
 from fla.models.mamba2.configuration_mamba2 import Mamba2Config
-from transformers.cache_utils import StaticCache,StaticLayer,DynamicCache
+from transformers.cache_utils import StaticCache,StaticLayer,DynamicCache,Cache
 from transformers.configuration_utils import PretrainedConfig
+from transformers.utils import ModelOutput
+from dataclasses import dataclass
 def register_custom_accelerator():
     from accelerate import Accelerator
 
@@ -38,7 +40,15 @@ def repeat_memkv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     return torch.repeat_interleave(hidden_states, dim=2, repeats=n_rep)
 
-
+@dataclass
+class CausalLMOutputWithPastAndRecLoss(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
+    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    loss_main: Optional[torch.FloatTensor] = None
+    loss_rec: Optional[torch.FloatTensor] = None
 
 class GroupLinear(nn.Module):
     def __init__(
@@ -460,15 +470,21 @@ class CacheWithMem(StaticCache):
             chunk_size=config.chunk_size,
             num_hidden_layers = config.num_hidden_layers,
         )
+
+        self.num_mem_tokens = getattr(config, "num_mem_tokens", 1)
+        self.mem_bank = [None for _ in range(config.num_hidden_layers)]  # 每层: Tensor[B, M, H] or None
+        self.mem_valid = [0 for _ in range(config.num_hidden_layers)]    # 每层: 当前有效 mem 数
+
         if dtype is None:
             dtype = getattr(config, "dtype", torch.float16)
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.evt_len = 0
         self.mem_position_embed = []
         self.mem_cache = Mamba2Cache(mamba_config, batch_size=kwargs.get('max_batch_size', 1), dtype=dtype, device=device, *args, **kwargs)
         self.hidden_cache = StaticHiddenCache(config, *args, **kwargs)
-        super().__init__(config, max_cache_len=config.sliding_window + 1 + config.num_attn_sinks, *args, **kwargs)
+
+        super().__init__(config, max_cache_len=config.sliding_window + self.num_mem_tokens + config.num_attn_sinks, *args, **kwargs)
         config = config.get_text_config(decoder=True)
         self.layers = []
         for layer_idx in range(config.num_hidden_layers):

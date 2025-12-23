@@ -48,6 +48,7 @@ from untils import (
     collect_compressor_state_dict,
     RandomSlidingWindowCallback,
     ResetMemCallback,
+    LogRecLossToWandbCallback,
     reinit_compressor,
 )
 from debugger import (
@@ -114,6 +115,7 @@ def parse_args():
     parser.add_argument("--mem_max_len", type=int, default=1024)
     parser.add_argument("--max_steps", type=int, default=-1,help="当使用 --streaming 时必须指定，或设置 --max_train_samples 让脚本自动估算。")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_mem_tokens", type=int, default=1)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--auto_resume", action="store_true")
@@ -230,7 +232,7 @@ class CompressorOnlyTrainer(Trainer):
             model_to_save = self.model_wrapped.module if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module") else (self.model.module if hasattr(self.model, "module") else self.model)
             sd = {} if self.args.process_index == 0 else None
             for name, p in model_to_save.named_parameters():
-                if ".compressor." in name:
+                if (".compressor." in name) or (".self_attn.rec_head." in name):
                     try:
                         with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
                             if self.args.process_index == 0:
@@ -284,7 +286,24 @@ class CompressorOnlyTrainer(Trainer):
                 torch.save(self.args, os.path.join(out_dir, "training_args.bin"))
             if path:
                 self.log({"compressor_ckpt": path})
+    def log(self, logs: dict, start_time=None):
+        # 只在 rank0 注入（避免多卡重复）
+        if self.state.is_world_process_zero:
+            m = self.model.module if hasattr(self.model, "module") else self.model
 
+            # 你的 rec loss 存在：Qwen2ForCausalLM.model.rec_loss_total
+            rec = getattr(getattr(m, "model", None), "rec_loss_total", None)
+            if rec is not None:
+                logs = dict(logs)  # 避免原地修改
+                logs["train/loss_rec"] = float(rec.detach().float().item())
+
+            # （可选）如果你在 Qwen2ForCausalLM.forward 里缓存了 loss_main_last
+            loss_main = getattr(m, "loss_main_last", None)
+            if loss_main is not None:
+                logs = dict(logs)
+                logs["loss_main"] = float(loss_main.detach().float().item())
+
+        return super().log(logs, start_time=start_time)
 
 def main():
     args = parse_args()
@@ -309,9 +328,11 @@ def main():
     config.sliding_window = args.init_sliding_window
     config.num_attn_sinks = args.num_attn_sinks
     config.mem_max_len = args.mem_max_len
+    config.num_mem_tokens = args.num_mem_tokens
     config.conv_kernel = 4
     config.state_size = 256
     config.chunk_size = 512
+    config.lambda_rec = 0.1
     # --- model ---
     # 注意：backbone 从 base 权重加载，compressor 为新增参数 -> ignore_mismatched_sizes=True
     model = AutoModelForCausalLM.from_pretrained(
@@ -331,10 +352,10 @@ def main():
     freeze_backbone_except_compressor(model)
     if not args.resume_from_checkpoint and not args.auto_resume:
         reinit_compressor(model)
-    # 不强制将 compressor 模块转换为 FP32，遵循全局 dtype（例如 bf16）
-    for n, m in model.named_modules():
-        if "compressor" in n:
-            m.to(torch.float32)
+    for n, p in model.named_parameters():
+        if ".self_attn.rec_head." in n:
+            p.requires_grad = True
+
     model.gradient_checkpointing_enable()
     # 初始化一次滑动窗口（训练中还会被回调随机覆盖）
     set_sliding_window(model, args.init_sliding_window)
@@ -369,25 +390,6 @@ def main():
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # --- 单步调试：在 compressor 子树挂钩并跑一个 step ---
-    if args.debug_one_step:
-        print("[debug] 开始 compressor 定向单步调试…")
-        register_param_sanity_checks(model, subtree_key="compressor")
-        err = debug_one_step(
-            model=model,
-            dataset=train_dataset,
-            collator=data_collator,
-            tokenizer=tokenizer,
-            batch_size=args.debug_batch_size,
-            use_amp=False,
-        )
-        if err is not None:
-            print(f"[debug] 捕获到异常：{err}. 若为 NaN/Inf，请查看上方模块钩子输出以定位来源。")
-        else:
-            print("[debug] 单步完成，未发现 NaN/Inf。")
-        if args.debug_only:
-            print("[debug] --debug_only 已设置，结束进程。")
-            return
-
     # --- training args ---
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -410,6 +412,7 @@ def main():
         fp16=args.fp16,
         optim="adamw_torch",
         report_to="wandb",  # 如需W&B等自行开启
+        run_name="dymem_rec",
         deepspeed=args.deepspeed,
     )
 
@@ -419,10 +422,7 @@ def main():
     win_choices = [w for w in win_choices if w < args.max_seq_len]
     if not win_choices:
         win_choices = [128, 256, 512, 1024]
-    callbacks = [
-        # RandomSlidingWindowCallback(win_choices),
-        # ResetMemCallback(),
-    ]
+
     model.config.windows_choices = win_choices
     # --- sanity check: 确保至少有一个参数可训练 ---
     num_trainable = sum(p.requires_grad for _, p in model.named_parameters())
@@ -432,6 +432,10 @@ def main():
             "Check freeze_backbone_except_compressor matching rules and your parameter names."
         )
 
+    callbacks = [
+        LogRecLossToWandbCallback(log_every_n_steps = 1),
+    ]
+
     trainer = CompressorOnlyTrainer(
         model=model,
         args=training_args,
@@ -440,6 +444,7 @@ def main():
         processing_class=tokenizer,
         callbacks=callbacks,
     )
+    dl = trainer.get_train_dataloader()
 
     def _find_latest_checkpoint(output_dir: str):
         if not os.path.isdir(output_dir):

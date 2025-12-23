@@ -189,7 +189,7 @@ def main():
     args = parser.parse_args()
 
     register_customized_qwen2(exist_ok=True)
-    device = torch.device(args.device or (os.environ.get('CUDA_DEVICE', 'cuda:3') if torch.cuda.is_available() else 'cpu'))
+    device = torch.device(args.device or (os.environ.get('CUDA_DEVICE', 'cuda:1') if torch.cuda.is_available() else 'cpu'))
     if torch.cuda.is_available() and device.type == 'cuda':
         torch.cuda.set_device(device)
 

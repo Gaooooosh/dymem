@@ -124,6 +124,8 @@ def collect_compressor_config(model: torch.nn.Module) -> Dict[str, object]:
             "num_attention_heads": _get("num_attention_heads", None),
             "num_key_value_heads": _get("num_key_value_heads", None),
             "num_hidden_layers": _get("num_hidden_layers", None),
+            "num_mem_tokens": _get("num_mem_tokens", None),
+            "lambda_rec": _get("lambda_rec", None),
         })
     return out
 
@@ -286,6 +288,41 @@ class RandomSlidingWindowCallback(TrainerCallback):
             print(f"[rand-win] step={state.global_step} batch_seq_len={seq_len} window={win} sink={target_sink}")
 
         return control
+
+class LogRecLossToWandbCallback(TrainerCallback):
+    def __init__(self, log_every_n_steps=1):
+        self.log_every_n_steps = log_every_n_steps
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # 这里 kwargs 里通常会带 trainer
+        self._trainer = kwargs.get("trainer", None)
+        if state.is_world_process_zero:
+            print("[LogRecLossToWandbCallback] on_train_begin called!")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # on_log 一定会被 Trainer 调用（每到 logging_steps）
+        if not state.is_world_process_zero:
+            return
+        if state.global_step % self.log_every_n_steps != 0:
+            return
+
+        model = kwargs.get("model", None)
+        if model is None:
+            print("[LogRecLossToWandbCallback] on_log called but model=None")
+            return
+
+        m = model.module if hasattr(model, "module") else model
+
+        # 你存 rec loss 的位置：Qwen2ForCausalLM -> .model.rec_loss_total
+        rec = getattr(getattr(m, "model", None), "rec_loss_total", None)
+        rec_main = getattr(getattr(m, "model", None), "loss_main", None)
+        if rec is None:
+            print(f"[LogRecLossToWandbCallback] step={state.global_step} rec_loss_total=None")
+            return
+
+        rec_val = float(rec.detach().float().item())
+        # print(f"[LogRecLossToWandbCallback] step={state.global_step} loss_rec={rec_val:.6f}")
+        logs["train/loss_rec"] = rec_val
 
 
 torch.no_grad()
@@ -454,6 +491,52 @@ def reinit_compressor(model, verbose=True,
                 module.variance_epsilon = max(getattr(module, "variance_epsilon", 1e-6), 1e-6)
             mem_touched += 1
 
+    rec_touched = 0
+    for name, module in model.named_modules():
+        if "rec_head" not in name.lower():
+            continue
+
+        if isinstance(module, nn.MultiheadAttention):
+            if getattr(module, "in_proj_weight", None) is not None:
+                init.normal_(module.in_proj_weight, mean=0.0, std=w_std)
+            if getattr(module, "in_proj_bias", None) is not None:
+                init.zeros_(module.in_proj_bias)
+            if getattr(module, "bias_k", None) is not None:
+                init.normal_(module.bias_k, mean=0.0, std=w_std)
+            if getattr(module, "bias_v", None) is not None:
+                init.normal_(module.bias_v, mean=0.0, std=w_std)
+            rec_touched += 1
+            continue
+
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=w_std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            rec_touched += 1
+            continue
+
+        if isinstance(module, nn.Conv1d):
+            init.normal_(module.weight, mean=0.0, std=w_std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            rec_touched += 1
+            continue
+
+        if isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=w_std)
+            rec_touched += 1
+            continue
+
+        if is_norm_like(module):
+            if hasattr(module, "weight") and module.weight is not None:
+                init.ones_(module.weight)
+            if hasattr(module, "bias") and module.bias is not None:
+                init.zeros_(module.bias)
+            if hasattr(module, "eps"):
+                module.eps = max(getattr(module, "eps", 1e-5), 1e-5)
+            rec_touched += 1
+            continue
+
     # 不再强制将 compressor 的敏感参数置为 FP32，遵循全局 dtype
     # for n, p in model.named_parameters():
     #     if "compressor" in n and any(k in n for k in ["A_log", "dt_bias"]):
@@ -464,6 +547,7 @@ def reinit_compressor(model, verbose=True,
               f"策略: Linear/Conv/Emb ~ N(0,{w_std}), Norm→(1,0), A_log→logspace[{a_min},{a_max}], "
               f"dt_proj.weight=0 & bias=inv_softplus(geo({dt_min},{dt_max})), dt_bias=0")
         print(f"[reinit_mem_norm] 已初始化 {mem_touched} 个 mem_norm 模块")
+        print(f"[reinit_rec_head] 已初始化 {rec_touched} 个 rec_head 子模块")
 
 
 class ResetMemCallback(TrainerCallback):
