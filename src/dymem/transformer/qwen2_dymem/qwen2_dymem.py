@@ -187,7 +187,7 @@ class ReusedProjReconstructor(nn.Module):
             v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [B, num_heads, M, hd]
         # 更快：SDPA（Pytorch 2.x）
         attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=0.5
         )  # [B,nh,E,hd]
 
         # merge heads -> [B,E,H] and o_proj
@@ -373,8 +373,10 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                         E = target.size(1)
 
                         pred = self.rec_head(mem_act, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
+                        with torch.no_grad():
+                            target_pred = self.rec_head(target, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
+                            tgt_n  = F.layer_norm(target_pred, (target_pred.size(-1),))
                         pred_n = F.layer_norm(pred, (pred.size(-1),))
-                        tgt_n  = F.layer_norm(target, (target.size(-1),))
                         self._last_rec_loss = self.rec_head.loss(pred_n, tgt_n)
 
                     if past_key_value is not None and self.config.use_cache:
@@ -802,7 +804,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             if loss_rec is None:
                 loss_rec = hidden_states.new_zeros(())
 
-            lam = getattr(self.config, "lambda_rec", 0.1)  # 你也可以写死或从 config 读
+            lam = getattr(self.config, "lambda_rec", 0.01)  # 你也可以写死或从 config 读
             loss = loss_main + lam * loss_rec
             self.loss_main_last = loss_main.detach()
 
@@ -812,8 +814,8 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            loss_rec=loss_rec.detach(),         # <= 关键：单独返回，detach 便于记录
-            loss_main=loss_main.detach(),       # <= 可选：主 loss 也记录
+            loss_rec=loss_rec.detach() if self.training else None,         # <= 关键：单独返回，detach 便于记录
+            loss_main=loss_main.detach() if self.training else None,       # <= 可选：主 loss 也记录
         )
 
 

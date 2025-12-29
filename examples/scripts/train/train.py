@@ -332,7 +332,10 @@ def main():
     config.conv_kernel = 4
     config.state_size = 256
     config.chunk_size = 512
-    config.lambda_rec = 0.1
+    config.lambda_rec = 0.05
+    config.rec_learnable_pos = False
+    config.rec_loss_type = "smooth_l1"
+    
     # --- model ---
     # 注意：backbone 从 base 权重加载，compressor 为新增参数 -> ignore_mismatched_sizes=True
     model = AutoModelForCausalLM.from_pretrained(
@@ -345,7 +348,6 @@ def main():
         trust_remote_code=False,
     )
     
-    # 修复权重名称：将所有 self_attn.mem_norm.* 转换为 self_attn.compressor.mem_norm.*
 
     # 冻结 backbone，仅训练 compressor
     model.train()
@@ -389,7 +391,6 @@ def main():
     train_dataset = build_dataset(tokenizer, args)
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # --- 单步调试：在 compressor 子树挂钩并跑一个 step ---
     # --- training args ---
     training_args = TrainingArguments(
         output_dir=args.output_dir,
