@@ -350,36 +350,38 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             keep_window_len = w
             evict_end_index = max(0, T - keep_window_len)
             overflow = max(0, evict_end_index - sink_len)
-            if self.compressor is not None and self.use_compress:
+            if self.compressor is not None:
                 if overflow > 0:
                     # 正确的被压缩段：去掉前端 sink 与末端滑窗，中间段作为被驱逐 token
                     evicted_hidden_states = prenormed_hidden[:, sink_len:evict_end_index, :]
                     E = evicted_hidden_states.shape[1]
                     M = self.num_mem_tokens
-                    idx, n_eff = self._sample_indices_include_last(E, M, device=evicted_hidden_states.device, mode="stratified")
-                    mem_out = self.compressor(
-                        evicted_hidden_states,
-                        cache_params=past_key_value.mem_cache if (self.config.use_cache and past_key_value is not None and not self.training) else None,
-                        cache_position=cache_position,
-                    )  # [B, EVC_T, H]
-                    mem_act = mem_out.index_select(dim=1, index=idx)  # [B, n_eff, H]
-                    # mem_act = mem_out[:, -1:, :] # [B, 1, H]
-                    evt_len += mem_out.shape[1]
+                    n_eff = 0
+                    if self.use_compress:
+                        idx, n_eff = self._sample_indices_include_last(E, M, device=evicted_hidden_states.device, mode="stratified")
+                        mem_out = self.compressor(
+                            evicted_hidden_states,
+                            cache_params=past_key_value.mem_cache if (self.config.use_cache and past_key_value is not None and not self.training) else None,
+                            cache_position=cache_position,
+                        )  # [B, EVC_T, H]
+                        mem_act = mem_out.index_select(dim=1, index=idx)  # [B, n_eff, H]
+                        # mem_act = mem_out[:, -1:, :] # [B, 1, H]
+                        evt_len += mem_out.shape[1]
 
-                    # ====== Rec loss (方案A): 用 mem_act 重建对应位置的 evicted hidden ======
-                    self._last_rec_loss = None
-                    if self.training and (mem_act is not None):
-                        target = evicted_hidden_states.detach()  # [B,E,H]
-                        E = target.size(1)
+                        # ====== Rec loss (方案A): 用 mem_act 重建对应位置的 evicted hidden ======
+                        self._last_rec_loss = None
+                        if self.training and (mem_act is not None):
+                            target = evicted_hidden_states.detach()  # [B,E,H]
+                            E = target.size(1)
 
-                        pred = self.rec_head(mem_act, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
-                        with torch.no_grad():
-                            target_pred = self.rec_head(target, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
-                            tgt_n  = F.layer_norm(target_pred, (target_pred.size(-1),))
-                        pred_n = F.layer_norm(pred, (pred.size(-1),))
-                        self._last_rec_loss = self.rec_head.loss(pred_n, tgt_n)
+                            pred = self.rec_head(mem_act, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
+                            with torch.no_grad():
+                                target_pred = self.rec_head(target, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
+                                tgt_n  = F.layer_norm(target_pred, (target_pred.size(-1),))
+                            pred_n = F.layer_norm(pred, (pred.size(-1),))
+                            self._last_rec_loss = self.rec_head.loss(pred_n, tgt_n)
 
-                    if past_key_value is not None and self.config.use_cache:
+                    if past_key_value is not None and self.config.use_cache and self.use_compress:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
                         past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
                         past_key_value.evt_len = evt_len
@@ -496,12 +498,12 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             evt_len = max(evt_len, 1)
             # 构造一个全 0 bias mask，只在 mem 列加上 bias
             
-            Le_fact = evt_len / (k_len + evt_len) / evt_len
+            Le_fact = evt_len / (k_len + evt_len)
             mem_bias_mask = torch.zeros_like(mask_arg)
-            mem_bias_mask[..., mem_pos:mem_pos + n_eff] = 10000 * Le_fact / n_eff
+            mem_bias_mask[..., mem_pos:mem_pos + n_eff] = 1 * Le_fact / n_eff
 
             # 叠加：原来的 causal mask + mem bias
-            mask_arg = mask_arg  + mem_bias_mask
+            mask_arg = mask_arg + mem_bias_mask
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -516,9 +518,11 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         )
         # 将 [B, T, heads, head_dim] 转为 [B, T, heads*head_dim]
         attn_output = attn_output.reshape(B, T, -1)
-        if mem_out is not None:
-            if T > 1:
+        if T > 1:
+            if mem_out is not None:    
                 attn_output = torch.cat([attn_output[:,:sink_len,:], mem_out[:,:-mem_act.shape[1],:], attn_output[:,sink_len:,:]], dim=1)
+            elif evicted_hidden_states is not None:
+                attn_output = torch.cat([attn_output[:,:sink_len,:], evicted_hidden_states, attn_output[:,sink_len:,:]], dim=1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -548,6 +552,7 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
