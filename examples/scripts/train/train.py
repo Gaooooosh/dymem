@@ -50,6 +50,9 @@ from untils import (
     ResetMemCallback,
     LogRecLossToWandbCallback,
     reinit_compressor,
+    save_mem_projector_weights,
+    load_mem_projector_weights,
+    reinit_mem_projector,
 )
 from debugger import (
     register_param_sanity_checks,
@@ -119,6 +122,7 @@ def parse_args():
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--report_to", type=str, default="wandb")
 
     # 调试选项
     parser.add_argument("--debug_one_step", action="store_true", help="开启单步前向+反向调试，捕捉 compressor 引入的 NaN/Inf。")
@@ -220,10 +224,53 @@ def build_dataset(tokenizer, args):
 
 class CompressorOnlyTrainer(Trainer):
     """覆写保存逻辑：只保存 compressor 权重"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_loss_main = None
+        self._last_loss_rec = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = None
+        if self.label_smoother is not None and "labels" in inputs:
+            inputs = dict(inputs)
+            labels = inputs.pop("labels")
+
+        outputs = model(**inputs)
+        if labels is not None:
+            loss = self.label_smoother(outputs, labels)
+        else:
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+
+        loss_main = None
+        loss_rec = None
+        if isinstance(outputs, dict):
+            loss_main = outputs.get("loss_main", None)
+            loss_rec = outputs.get("loss_rec", None)
+        else:
+            loss_main = getattr(outputs, "loss_main", None)
+            loss_rec = getattr(outputs, "loss_rec", None)
+
+        if loss_main is not None:
+            self._last_loss_main = loss_main.detach()
+        if loss_rec is not None:
+            self._last_loss_rec = loss_rec.detach()
+
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+    def log(self, logs, *args, **kwargs):
+        if self._last_loss_main is not None and "train/loss_main" not in logs:
+            logs["loss_main"] = float(self._last_loss_main.detach().float().item())
+        if self._last_loss_rec is not None and "train/loss_rec" not in logs:
+            logs["loss_rec"] = float(self._last_loss_rec.detach().float().item())
+        return super().log(logs, *args, **kwargs)
+
     def save_model(self, output_dir: str = None, _internal_call: bool = True):
         out_dir = output_dir or self.args.output_dir
         os.makedirs(out_dir, exist_ok=True)
         path = None
+        mem_path = None
         if getattr(self.args, "deepspeed", None):
             try:
                 import deepspeed
@@ -231,6 +278,7 @@ class CompressorOnlyTrainer(Trainer):
                 pass
             model_to_save = self.model_wrapped.module if hasattr(self, "model_wrapped") and hasattr(self.model_wrapped, "module") else (self.model.module if hasattr(self.model, "module") else self.model)
             sd = {} if self.args.process_index == 0 else None
+            mp_sd = {} if self.args.process_index == 0 else None
             for name, p in model_to_save.named_parameters():
                 if (".compressor." in name) or (".self_attn.rec_head." in name):
                     try:
@@ -238,6 +286,14 @@ class CompressorOnlyTrainer(Trainer):
                             if self.args.process_index == 0:
                                 if p is not None and p.data is not None and p.data.numel() > 0:
                                     sd[name] = p.data.detach().cpu().clone()
+                    except Exception:
+                        pass
+                elif "mem_projector." in name:
+                    try:
+                        with deepspeed.zero.GatheredParameters(p, modifier_rank=0):
+                            if self.args.process_index == 0:
+                                if p is not None and p.data is not None and p.data.numel() > 0:
+                                    mp_sd[name] = p.data.detach().cpu().clone()
                     except Exception:
                         pass
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -269,8 +325,17 @@ class CompressorOnlyTrainer(Trainer):
                     torch.distributed.barrier()
                 except Exception:
                     pass
+            if self.args.process_index == 0 and mp_sd:
+                mem_path = os.path.join(out_dir, "mem_projector.pt")
+                torch.save(mp_sd, mem_path)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                except Exception:
+                    pass
         else:
             path = save_compressor_weights(self.model, out_dir)
+            mem_path = save_mem_projector_weights(self.model, out_dir)
             try:
                 sd_local = collect_compressor_state_dict(self.model)
                 if getattr(self.args, "save_safetensors", True):
@@ -286,24 +351,8 @@ class CompressorOnlyTrainer(Trainer):
                 torch.save(self.args, os.path.join(out_dir, "training_args.bin"))
             if path:
                 self.log({"compressor_ckpt": path})
-    def log(self, logs: dict, start_time=None):
-        # 只在 rank0 注入（避免多卡重复）
-        if self.state.is_world_process_zero:
-            m = self.model.module if hasattr(self.model, "module") else self.model
-
-            # 你的 rec loss 存在：Qwen2ForCausalLM.model.rec_loss_total
-            rec = getattr(getattr(m, "model", None), "rec_loss_total", None)
-            if rec is not None:
-                logs = dict(logs)  # 避免原地修改
-                logs["train/loss_rec"] = float(rec.detach().float().item())
-
-            # （可选）如果你在 Qwen2ForCausalLM.forward 里缓存了 loss_main_last
-            loss_main = getattr(m, "loss_main_last", None)
-            if loss_main is not None:
-                logs = dict(logs)
-                logs["loss_main"] = float(loss_main.detach().float().item())
-
-        return super().log(logs, start_time=start_time)
+            if mem_path:
+                self.log({"mem_projector_ckpt": mem_path})
 
 def main():
     args = parse_args()
@@ -354,8 +403,12 @@ def main():
     freeze_backbone_except_compressor(model)
     if not args.resume_from_checkpoint and not args.auto_resume:
         reinit_compressor(model)
+        reinit_mem_projector(model)
     for n, p in model.named_parameters():
         if ".self_attn.rec_head." in n:
+            p.requires_grad = True
+    if hasattr(model, "mem_projector"):
+        for p in model.mem_projector.parameters():
             p.requires_grad = True
 
     model.gradient_checkpointing_enable()
@@ -412,8 +465,8 @@ def main():
         bf16=args.bf16,
         fp16=args.fp16,
         optim="adamw_torch",
-        report_to="wandb",  # 如需W&B等自行开启
-        run_name="dymem_rec",
+        report_to=args.report_to,
+        run_name="dymem_rec_new",
         deepspeed=args.deepspeed,
     )
 
@@ -434,7 +487,6 @@ def main():
         )
 
     callbacks = [
-        LogRecLossToWandbCallback(log_every_n_steps = 1),
     ]
 
     trainer = CompressorOnlyTrainer(
@@ -492,6 +544,16 @@ def main():
         if os.path.exists(cpath):
             try:
                 load_compressor_weights(model, cpath, strict=False)
+            except Exception:
+                pass
+        mpath = None
+        if os.path.isfile(resume_path) and resume_path.endswith("mem_projector.pt"):
+            mpath = resume_path
+        elif os.path.isdir(resume_path):
+            mpath = os.path.join(resume_path, "mem_projector.pt")
+        if mpath and os.path.exists(mpath):
+            try:
+                load_mem_projector_weights(model, mpath, strict=False)
             except Exception:
                 pass
         if os.path.isdir(resume_path) and _has_hf_model_files(resume_path) and _has_trainer_state(resume_path):

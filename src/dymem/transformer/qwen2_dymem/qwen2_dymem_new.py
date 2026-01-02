@@ -92,118 +92,6 @@ class Qwen2Config(Qwen2Config_):
         self.dtype = dtype
 
 
-class ReusedProjReconstructor(nn.Module):
-    """
-    用“本层已有的 q_proj/k_proj/v_proj/o_proj”做 cross-attn 重建：
-      pred = Attn( Q = q_proj(query_hidden),
-                   K,V = k_proj(mem_act), v_proj(mem_act) ) -> o_proj
-    query_hidden 由位置编码生成（learnable 或 fixed sincos）
-
-    这个模块本身不创建注意力权重，不会新增 Q/K/V/O 参数。
-    可选新增一个 rec_pos_emb（learnable），参数量很小。
-    """
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        head_dim: int,
-        scaling: float,
-        mem_max_len: int,
-        use_learnable_pos: bool = False,
-        loss_type: str = "mse",          # "mse" | "smooth_l1"
-        smooth_l1_beta: float = 0.1,
-        use_layernorm_on_q: bool = False,
-        num_kv_heads: int = 16,
-        num_kv_groups: int = 2,
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scaling = scaling
-        self.mem_max_len = mem_max_len
-        self.num_kv_heads = num_kv_heads
-        self.num_kv_groups = num_kv_groups
-        self.use_learnable_pos = use_learnable_pos
-        if use_learnable_pos:
-            self.rec_pos_emb = nn.Embedding(mem_max_len, hidden_size)
-        else:
-            self.rec_pos_emb = None
-
-        self.loss_type = loss_type
-        self.smooth_l1_beta = smooth_l1_beta
-
-        self.use_layernorm_on_q = use_layernorm_on_q
-        self.q_ln = nn.LayerNorm(hidden_size) if use_layernorm_on_q else nn.Identity()
-
-    @staticmethod
-    def _fixed_sincos_pos(E: int, H: int, device, dtype):
-        # [E, H] fixed sin/cos positional encoding (no params)
-        half = H // 2
-        freq = torch.exp(
-            -math.log(10000.0) * torch.arange(0, half, device=device, dtype=dtype) / max(1, half)
-        )
-        pos = torch.arange(E, device=device, dtype=dtype).unsqueeze(1)  # [E,1]
-        ang = pos * freq.unsqueeze(0)                                  # [E,half]
-        pe = torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)        # [E,2*half]
-        if H % 2 == 1:
-            pe = F.pad(pe, (0, 1))
-        return pe  # [E,H]
-
-    def build_query_hidden(self, B: int, E: int, device, dtype):
-        pos = torch.arange(E, device=device, dtype=torch.long)
-        pos = pos.clamp(max=self.mem_max_len - 1)
-
-        if self.rec_pos_emb is not None:
-            q_hidden = self.rec_pos_emb(pos).to(dtype=dtype)  # [E,H]
-        else:
-            q_hidden = self._fixed_sincos_pos(E, self.hidden_size, device, dtype)
-
-        q_hidden = q_hidden.unsqueeze(0).expand(B, -1, -1)  # [B,E,H]
-        q_hidden = self.q_ln(q_hidden)
-        return q_hidden, pos
-
-    def forward(self, mem_act: torch.Tensor, E: int, q_proj: nn.Module, k_proj: nn.Module, v_proj: nn.Module, o_proj: nn.Module):
-        """
-        mem_act: [B, M, H]
-        E: 要重建的长度
-        return pred: [B, E, H]
-        """
-        B, M, H = mem_act.shape
-        assert H == self.hidden_size, f"hidden mismatch: mem_act H={H} vs {self.hidden_size}"
-
-        device, dtype = mem_act.device, mem_act.dtype
-        q_hidden, _ = self.build_query_hidden(B, E, device, dtype)  # [B,E,H]
-
-        # project -> [B, nh, L, hd]
-        B, M, H = mem_act.shape
-        q = q_proj(q_hidden).view(B, E, self.num_heads, self.head_dim).transpose(1, 2)  # [B,nh,E,hd]
-        k = k_proj(mem_act).view(B, M, self.num_kv_heads, self.head_dim).transpose(1, 2)  # [B, kvh, M, hd]
-        v = v_proj(mem_act).view(B, M, self.num_kv_heads, self.head_dim).transpose(1, 2)  # [B, kvh, M, hd]
-
-        # 扩展 K/V 到 num_heads（GQA: 每个 kv head 复用给多个 q head）
-        if self.num_kv_heads != self.num_heads:
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [B, num_heads, M, hd]
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [B, num_heads, M, hd]
-        # 更快：SDPA（Pytorch 2.x）
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=0.5
-        )  # [B,nh,E,hd]
-
-        # merge heads -> [B,E,H] and o_proj
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, E, H)
-        pred = o_proj(attn_out)  # [B,E,H]
-        return pred
-
-    def loss(self, pred: torch.Tensor, target: torch.Tensor):
-        """
-        pred/target: [B,E,H]
-        默认建议 target 传入 detach() 后的张量（外部做 detach）
-        """
-        if self.loss_type == "smooth_l1":
-            return F.smooth_l1_loss(pred, target, reduction="mean", beta=self.smooth_l1_beta)
-        return F.mse_loss(pred, target, reduction="mean")
-
 class Qwen2AttentionWithMem(Qwen2Attention):
 
     def __init__(self, config, layer_idx: int):
@@ -246,22 +134,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
         self.recent_k = None  # [B,H,W,D]
         self.recent_v = None
-        # 在 Qwen2AttentionWithMem.__init__ 末尾加
-
-        self.rec_head = ReusedProjReconstructor(
-            hidden_size=config.hidden_size,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            num_kv_heads=self.num_kv_heads,
-            num_kv_groups=self.num_kv_groups,
-            scaling=self.scaling,
-            mem_max_len=self.mem_max_len,
-            use_learnable_pos=getattr(config, "rec_learnable_pos", False),  # True=新增pos表；False=零参数
-            loss_type=getattr(config, "rec_loss_type", "smooth_l1"),
-            smooth_l1_beta=getattr(config, "rec_smooth_l1_beta", 0.1),
-            use_layernorm_on_q=getattr(config, "rec_ln_q", False),
-        )
-        self._last_rec_loss = None  # 每次 forward 会覆盖
 
 
     @staticmethod
@@ -341,6 +213,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         input_shape = prenormed_hidden.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         # 预填充阶段可能会更改序列长度，先处理压缩拼接，再计算投影视图形状
+        evicted_hidden_states = None
         mem_act = None # the mem_tensor that is used to attend to the current token
         mem_out = None # mem_out is the output hidden_state of compressor
         evt_len = 0
@@ -367,19 +240,6 @@ class Qwen2AttentionWithMem(Qwen2Attention):
                         mem_act = mem_out.index_select(dim=1, index=idx)  # [B, n_eff, H]
                         # mem_act = mem_out[:, -1:, :] # [B, 1, H]
                         evt_len += mem_out.shape[1]
-
-                        # ====== Rec loss (方案A): 用 mem_act 重建对应位置的 evicted hidden ======
-                        self._last_rec_loss = None
-                        if self.training and (mem_act is not None):
-                            target = evicted_hidden_states.detach()  # [B,E,H]
-                            E = target.size(1)
-
-                            pred = self.rec_head(mem_act, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
-                            # with torch.no_grad():
-                                # target_pred = self.rec_head(target, E, self.q_proj, self.k_proj, self.v_proj, self.o_proj)    # [B,E,H]
-                                # tgt_n  = F.layer_norm(target_pred, (target_pred.size(-1),))
-                            pred_n = F.layer_norm(pred, (pred.size(-1),))
-                            self._last_rec_loss = self.rec_head.loss(pred_n, target)
 
                     if past_key_value is not None and self.config.use_cache and self.use_compress:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
@@ -519,9 +379,10 @@ class Qwen2AttentionWithMem(Qwen2Attention):
         # 将 [B, T, heads, head_dim] 转为 [B, T, heads*head_dim]
         attn_output = attn_output.reshape(B, T, -1)
         if T > 1:
-            if mem_out is not None:    
+            if mem_out is not None:   
+                # mem_act is attn_output[:,sink_len:sink_len + n_eff,:] 
                 attn_output = torch.cat([attn_output[:,:sink_len + n_eff,:], mem_out[:,:-mem_act.shape[1],:], attn_output[:,sink_len + n_eff:,:]], dim=1)
-            elif evicted_hidden_states is not None:
+            elif evicted_hidden_states is not None and not self.training and not self.use_compress:
                 attn_output = torch.cat([attn_output[:,:sink_len,:], evicted_hidden_states, attn_output[:,sink_len:,:]], dim=1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -673,8 +534,10 @@ class Qwen2Model(Qwen2Model_):
         all_self_attns = () if output_attentions else None
         if self.training:
             w = random.choice(self.config.windows_choices)
-            num_mem = random.choice([1,2,4,8,16,24,32,64,128,256])
+            num_mem = random.choice([1,2,2,4,4,8,8,16,16,24,32,64])
             # print(f"sliding_window: {w}")
+            self.w = w
+            self.num_mem = num_mem
             for layer in self.layers:
                 if hasattr(layer, "self_attn"):
                     layer.self_attn.sliding_window = w
@@ -683,8 +546,6 @@ class Qwen2Model(Qwen2Model_):
             self.sliding_window = self.config.sliding_window
             # print(f"sliding_window: {self.sliding_window}")
 
-
-        rec_loss_total = None  # 用 None 避免无压缩时创建无意义 tensor
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -700,13 +561,6 @@ class Qwen2Model(Qwen2Model_):
             )
             hidden_states = layer_outputs[0]
 
-            # 累加来自 self_attn 的 rec loss
-            if self.training and hasattr(decoder_layer, "self_attn"):
-                lrec = getattr(decoder_layer.self_attn, "_last_rec_loss", None)
-                if lrec is not None:
-                    rec_loss_total = lrec if rec_loss_total is None else (rec_loss_total + lrec)
-
-
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -715,12 +569,6 @@ class Qwen2Model(Qwen2Model_):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        # 如果没有发生压缩，给一个 0，保持接口稳定
-        if rec_loss_total is None:
-            rec_loss_total = hidden_states.new_zeros(())
-        self.rec_loss_total = rec_loss_total
-
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -739,7 +587,12 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.mem_projector = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            # nn.LayerNorm(config.hidden_size)
+        )
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -776,7 +629,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> CausalLMOutputWithPastAndRecLoss:
+    ) -> CausalLMOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -800,18 +653,70 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-
         loss = None
+        loss_main = None
         if labels is not None:
             loss_main = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            # 取模型里累加好的 rec loss
-            loss_rec = getattr(self.model, "rec_loss_total", None)
-            if loss_rec is None:
-                loss_rec = hidden_states.new_zeros(())
 
-            lam = getattr(self.config, "lambda_rec", 0.01)  # 你也可以写死或从 config 读
-            loss = loss_main + lam * loss_rec
-            self.loss_main_last = loss_main.detach()
+        # pass 2:
+        recall_n = kwargs.get("recall_n", 512)
+        aux_loss_coef = kwargs.get("aux_loss_coef", 0.5)
+        aux_loss = None
+        if aux_loss_coef > 0 and recall_n > 0 and self.training:
+            sink_len = self.config.num_attn_sinks
+            n_eff = self.model.num_mem
+            batch_size = input_ids.shape[0]
+            device = input_ids.device
+            # 1. 准备输入
+            prefix_ids_list = [576, 13550, 2266, 374, 25]
+            prefix_ids = torch.tensor(prefix_ids_list, device=device).unsqueeze(0).repeat(batch_size, 1)
+            prefix_embeds = self.model.embed_tokens(prefix_ids)
+
+            target_ids = input_ids[:, sink_len : sink_len + recall_n]
+            target_embeds = self.model.embed_tokens(target_ids)
+
+            raw_mem_tokens = outputs.last_hidden_state[:, sink_len : sink_len + n_eff, :]
+            projected_mem_embeds = self.mem_projector(raw_mem_tokens)
+
+            full_input_embeds = torch.cat([prefix_embeds, projected_mem_embeds, target_embeds], dim=1)
+
+            # 2. Forward (不传 Label，手动算)
+            aux_outputs = self.model(
+                inputs_embeds=full_input_embeds,
+                labels=None,            # 建议改为 None，避免内部重复计算
+                past_key_values=None,   
+                use_cache=False,
+            )
+
+            # 3. 切片 Logits
+            # 我们只需要预测 Target 部分
+            # Input 序列结构: [Prefix] [Mem] [Target]
+            # 预测 Target[0] 的是 Mem 的最后一位 (index: prefix_len + n_eff - 1)
+            # 预测 Target[last] 的是 Target[last-1] (index: total - 2, 也就是 -2)
+            # 所以切片是从 (Mem_End) 到 (Target_End - 1)
+            
+            prefix_len = prefix_embeds.shape[1]
+            start_idx = prefix_len + n_eff - 1
+            end_idx = -1 # 排除掉最后一位 Input (因为没有 Target 来对应它的预测结果)
+            
+            aux_slice_indices = slice(start_idx, end_idx)
+            
+            # [Batch, 128, Vocab]
+            aux_logits = self.lm_head(aux_outputs.last_hidden_state[:, aux_slice_indices, :])
+            
+            # 4. 计算 Loss
+            # Logits 对应的是对 target_ids 的预测
+            # 所以 labels 必须是 target_ids
+            aux_loss = self.loss_function(
+                logits=aux_logits, 
+                labels=target_ids, # <--- 关键修正点
+                vocab_size=self.config.vocab_size, 
+                **kwargs
+            )
+            
+            # 加回总 loss (如果需要)
+            aux_loss = aux_loss * aux_loss_coef
+            loss = loss_main + aux_loss
 
         return CausalLMOutputWithPastAndRecLoss(
             loss=loss,
@@ -819,8 +724,8 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            loss_rec=loss_rec.detach() if self.training else None,         # <= 关键：单独返回，detach 便于记录
-            loss_main=loss_main.detach() if self.training else None,       # <= 可选：主 loss 也记录
+            loss_main = loss_main,
+            loss_rec = aux_loss
         )
 
 

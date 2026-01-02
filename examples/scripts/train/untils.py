@@ -102,6 +102,15 @@ def collect_compressor_state_dict(model: torch.nn.Module) -> Dict[str, torch.Ten
     full_sd = model.state_dict()
     return {k: v for k, v in full_sd.items() if ".compressor." in k}
 
+def collect_mem_projector_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    if hasattr(model, "module"):
+        model = model.module
+    mp = getattr(model, "mem_projector", None)
+    if mp is None:
+        return {}
+    sd = mp.state_dict()
+    return {f"mem_projector.{k}": v.detach().cpu().clone() for k, v in sd.items()}
+
 def collect_compressor_config(model: torch.nn.Module) -> Dict[str, object]:
     cfg = getattr(model, "config", None)
     out = {}
@@ -156,6 +165,21 @@ def save_compressor_weights(model: torch.nn.Module, path_or_dir: str) -> str:
     return path
 
 
+def save_mem_projector_weights(model: torch.nn.Module, path_or_dir: str) -> str:
+    sd = collect_mem_projector_state_dict(model)
+    if os.path.isdir(path_or_dir) or path_or_dir.endswith(os.sep):
+        os.makedirs(path_or_dir, exist_ok=True)
+        path = os.path.join(path_or_dir, "mem_projector.pt")
+    else:
+        dirn = os.path.dirname(path_or_dir)
+        if dirn:
+            os.makedirs(dirn, exist_ok=True)
+        path = path_or_dir
+    torch.save(sd, path)
+    print(f"[save] mem_projector weights -> {path} ({len(sd)} tensors)")
+    return path
+
+
 def load_compressor_weights(model: torch.nn.Module, compressor_path: str, strict: bool = False):
     """将 compressor 权重加载到当前模型（strict=False 更稳妥）。"""
     sd = torch.load(compressor_path, map_location="cpu")
@@ -178,6 +202,46 @@ def load_compressor_weights(model: torch.nn.Module, compressor_path: str, strict
     missing, unexpected = model.load_state_dict(sd, strict=strict)
     print(f"[load] compressor from {compressor_path} | missing={len(missing)} unexpected={len(unexpected)}")
     return missing, unexpected
+
+
+def load_mem_projector_weights(model: torch.nn.Module, mem_projector_path: str, strict: bool = True):
+    sd = torch.load(mem_projector_path, map_location="cpu")
+    if hasattr(model, "module"):
+        model = model.module
+    mp = getattr(model, "mem_projector", None)
+    if mp is None:
+        return ["mem_projector"], []
+    prefix = "mem_projector."
+    sub_sd = {}
+    for k, v in sd.items():
+        if k.startswith(prefix):
+            sub_sd[k[len(prefix):]] = v
+        elif k.startswith("module." + prefix):
+            sub_sd[k[len("module." + prefix):]] = v
+    missing, unexpected = mp.load_state_dict(sub_sd, strict=strict)
+    print(f"[load] mem_projector from {mem_projector_path} | missing={len(missing)} unexpected={len(unexpected)}")
+    return missing, unexpected
+
+
+@torch.no_grad()
+def reinit_mem_projector(model: torch.nn.Module, w_std: float = None):
+    if hasattr(model, "module"):
+        model = model.module
+    mp = getattr(model, "mem_projector", None)
+    if mp is None:
+        return 0
+    if w_std is None:
+        cfg = getattr(model, "config", None)
+        w_std = float(getattr(cfg, "initializer_range", 0.002) if cfg is not None else 0.002)
+    touched = 0
+    for module in mp.modules():
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=w_std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            touched += 1
+    print(f"[reinit_mem_projector] initialized {touched} Linear layers (std={w_std})")
+    return touched
 
 
 # ------- 合并导出：压缩器 + Qwen 基座 -> 完整可用HF模型 --------
