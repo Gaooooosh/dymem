@@ -243,7 +243,8 @@ class Qwen2AttentionWithMem(Qwen2Attention):
 
                     if past_key_value is not None and self.config.use_cache and self.use_compress:
                         past_key_value.hidden_cache.update(prenormed_hidden[:,evict_end_index:, :], layer_idx=self.layer_idx)
-                        past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len, :],position_embeddings[1][:, sink_len, :]))
+                        # past_key_value.mem_position_embed.append((position_embeddings[0][:, sink_len:sink_len+n_eff, :],position_embeddings[1][:, sink_len:sink_len+n_eff, :]))
+                        past_key_value.mem_position_embed.append((position_embeddings[0][:, -n_eff:, :],position_embeddings[1][:, -n_eff:, :]))
                         past_key_value.evt_len = evt_len
                         past_key_value.mem_bank[self.layer_idx] = mem_act.detach()
                         past_key_value.mem_valid[self.layer_idx] = n_eff
@@ -322,14 +323,24 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             sink_len = self.num_attn_sinks
             n_eff = mem_act.shape[1]  # [B, n_eff, H]
             mem_hidden_shape = (B, n_eff, -1, self.head_dim)
+            mem_q = self.q_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
             mem_k = self.k_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
             mem_v = self.v_proj(mem_act).view(mem_hidden_shape).transpose(1, 2) # [B, H, 1, D]
-            # mem_q,mem_k = apply_rotary_pos_emb(mem_q, mem_k, *past_key_value.mem_position_embed[-1])
+            # if self.layer_idx >=34:
+            #     # todo: 让mem_v的强度变为原来的两倍
+            #     mem_v = mem_v*2.0
+            if past_key_value is not None:
+                mem_q,mem_k = apply_rotary_pos_emb(mem_q, mem_k, *(past_key_value.mem_position_embed[-1]))
+            else:
+                # mem_q,mem_k = apply_rotary_pos_emb(mem_q, mem_k, cos[:, sink_len:sink_len+n_eff, :], sin[:, sink_len:sink_len+n_eff, :])
+                mem_q,mem_k = apply_rotary_pos_emb(mem_q, mem_k, cos[:, -n_eff:, :], sin[:, -n_eff:, :])
             key_states[:, :, sink_len:sink_len + n_eff, :] = mem_k
             value_states[:, :, sink_len:sink_len + n_eff, :] = mem_v
+            if T > 1:
+                query_states[:, :, sink_len:sink_len + n_eff, :] = mem_q
             # if T > 1:
             #     mem_q = self.q_proj(mem_act).view(mem_hidden_shape).transpose(1, 2)
-            #     query_states[:, :, sink_len:sink_len + n_eff, :] = mem_q
+            
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -351,7 +362,7 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             k_len = key_states.shape[-2]          # 经过 cache/sliding_window 后真正参与注意力的 key 长度
             mem_pos = self.num_attn_sinks                # 假设 mem token 在最后一个 key 位置
             n_eff = mem_act.shape[1]
-
+            min_val = torch.finfo(mask_arg.dtype).min
             # 截取当前会用到的部分
             mask_arg = mask_arg[:, :, :, :k_len]
             evt_len = evt_len if ((self.config.use_cache and past_key_value is not None) or self.training) else past_key_value.evt_len
@@ -360,10 +371,15 @@ class Qwen2AttentionWithMem(Qwen2Attention):
             
             Le_fact = evt_len / (k_len + evt_len)
             mem_bias_mask = torch.zeros_like(mask_arg)
-            mem_bias_mask[..., mem_pos:mem_pos + n_eff] = 1 * Le_fact / n_eff
+            mem_bias_mask[..., mem_pos:mem_pos + n_eff] = 5 * Le_fact / n_eff
 
             # 叠加：原来的 causal mask + mem bias
             mask_arg = mask_arg + mem_bias_mask
+            mask_arg = torch.where(
+                torch.tril(torch.ones_like(mask_arg), diagonal=0).bool(),
+                mask_arg,
+                torch.tensor(min_val, dtype=mask_arg.dtype, device=mask_arg.device)
+            ) # 强制变为下三角阵
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -437,7 +453,10 @@ class Qwen2DyMemDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
+        if past_key_value is not None:
+            if hidden_states.shape[1] > 128:
+                past_key_value.mem_hidden[self.layer_idx] = hidden_states[:, 128, :]
+            
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -659,7 +678,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             loss_main = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         # pass 2:
-        recall_n = kwargs.get("recall_n", 512)
+        recall_n = kwargs.get("recall_n", 1)
         aux_loss_coef = kwargs.get("aux_loss_coef", 0.5)
         aux_loss = None
         if aux_loss_coef > 0 and recall_n > 0 and self.training:
@@ -667,8 +686,9 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             n_eff = self.model.num_mem
             batch_size = input_ids.shape[0]
             device = input_ids.device
+            recall_n = 32*n_eff
             # 1. 准备输入
-            prefix_ids_list = [576, 13550, 2266, 374, 25]
+            prefix_ids_list = [576, 13550, 2266, 374, 25] # The mem is:
             prefix_ids = torch.tensor(prefix_ids_list, device=device).unsqueeze(0).repeat(batch_size, 1)
             prefix_embeds = self.model.embed_tokens(prefix_ids)
 
@@ -678,7 +698,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM_):
             raw_mem_tokens = outputs.last_hidden_state[:, sink_len : sink_len + n_eff, :]
             projected_mem_embeds = self.mem_projector(raw_mem_tokens)
 
-            full_input_embeds = torch.cat([prefix_embeds, projected_mem_embeds, target_embeds], dim=1)
+            full_input_embeds = torch.cat([projected_mem_embeds, prefix_embeds, target_embeds], dim=1)
 
             # 2. Forward (不传 Label，手动算)
             aux_outputs = self.model(

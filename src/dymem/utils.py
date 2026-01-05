@@ -474,7 +474,7 @@ class CacheWithMem(StaticCache):
         self.num_mem_tokens = getattr(config, "num_mem_tokens", 1)
         self.mem_bank = [None for _ in range(config.num_hidden_layers)]  # 每层: Tensor[B, M, H] or None
         self.mem_valid = [0 for _ in range(config.num_hidden_layers)]    # 每层: 当前有效 mem 数
-
+        self.mem_hidden = [None for _ in range(config.num_hidden_layers)]  # 每层: 缓存的 hidden states
         if dtype is None:
             dtype = getattr(config, "dtype", torch.float16)
         if device is None:
