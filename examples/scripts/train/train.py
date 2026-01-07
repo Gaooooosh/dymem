@@ -92,7 +92,7 @@ def parse_args():
     parser.add_argument("--num_train_epochs", type=float, default=1.0)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
     # 梯度裁剪
     parser.add_argument("--max_grad_norm", type=float, default=0.5,
